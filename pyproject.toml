@@ -34,11 +34,9 @@ dependencies = [
   "ruamel-yaml>=0.18",
   "scikit-learn>=1.5",
   "scipy>=1.13",
-  "session-info2",
 ]
 optional-dependencies.mpi = [ "mpi4py>=4" ]
 # https://docs.pypi.org/project_metadata/#project-urls
-urls.Documentation = "https://bonsai.readthedocs.io/"
 urls.Homepage = "https://github.com/mlbelab/bonsai"
 urls.Source = "https://github.com/mlbelab/bonsai"
 scripts.bonsai = "bonsai.cli:main"
@@ -62,7 +60,6 @@ doc = [
   "sphinx-book-theme>=1",
   "sphinx-copybutton",
   "sphinx-design",
-  "sphinxcontrib-bibtex>=1",
   "sphinxcontrib-katex",
   "sphinxext-opengraph",
 ]
@@ -72,7 +69,10 @@ typecheck = [
 ]
 
 [tool.hatch]
-build.targets.sdist.exclude = [ "/docs", "/tests" ]
+# The golden fixture .npy files are force-un-ignored in .gitignore (`!tests/data/golden_b16ef6f/*.npy`,
+# needed so git itself tracks them); that negation also overrides a plain "/tests" sdist exclude, so list
+# them explicitly here too.
+build.targets.sdist.exclude = [ "/docs", "/tests", "tests/data/golden_b16ef6f/*.npy" ]
 envs.default.installer = "uv"
 envs.default.dependency-groups = [ "dev" ]
 envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
@@ -165,11 +165,10 @@ run.patch = [ "subprocess" ]
 [tool.cruft]
 skip = [
   ".git",
+  "LICENSE",
   "tests",
   "src/**/__init__.py",
   "docs/api.md",
   "docs/changelog.md",
-  "docs/references.bib",
-  "docs/references.md",
   "docs/notebooks/example.ipynb",
 ]

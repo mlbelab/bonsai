@@ -52,7 +52,6 @@ jobs:
   test:
     needs: get-environments
     permissions:
-       id-token: write  # for codecov OIDC
        contents: read
 
     strategy:
@@ -80,17 +79,6 @@ jobs:
           PLATFORM: ${{ matrix.os }}
           DISPLAY: :42
         run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto
-      - name: generate coverage report
-        run: |
-          # See https://coverage.readthedocs.io/page/config.html#run-patch
-          test -f .coverage || uvx hatch run ${{ matrix.env.name }}:cov-combine
-          uvx hatch run ${{ matrix.env.name }}:cov-report   # report visibly
-          uvx hatch run ${{ matrix.env.name }}:coverage xml # create report for upload
-      - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          fail_ci_if_error: true
-          use_oidc: true
 
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
   # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
