@@ -375,7 +375,7 @@ class TreeNode:
                 return selected_node
             else:
                 counter += child.n_ds_nodes
-        exit("Something went wrong! Couldn't find the {} node on this tree.".format(nth_node))
+        raise BonsaiError("Something went wrong! Couldn't find the {} node on this tree.".format(nth_node))
 
     def reset_root_node(self, parent_ind=None, old_tParent=None):
         # Get all connecting nodes
@@ -4915,7 +4915,8 @@ def getOptTime2LeafTree(ltqs1_g, ltqsVars1_g, ltqs2_g, ltqsVars2_g, tol=1e-7):
         if lb_bracket > 1e6:
             return None, False
         if value_ub > 1e9:
-            exit()
+            raise BonsaiError("Bisection to find the optimal leaf-pair distance diverged: the second derivative "
+                              "stayed positive past a bracket of 1e9.")
     opt_dist, opt_sol = brentq(der2LeafTree, lb_bracket, ub_bracket,
                                (summedLtqsVars_g, sqDists_g),
                                rtol=tol, full_output=True)

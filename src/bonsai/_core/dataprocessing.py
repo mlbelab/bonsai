@@ -15,9 +15,6 @@ import logging
 
 FORMAT = '%(asctime)s %(funcName)s %(levelname)s %(message)s'
 log_level = logging.DEBUG
-logging.basicConfig(format=FORMAT,
-                    datefmt='%m-%d %H:%M:%S',
-                    level=logging.WARNING)  # silence all libraries
 
 # Create your app logger
 logger = logging.getLogger("myapp")
@@ -77,9 +74,10 @@ class Metadata:
         if hasattr(self, 'nCells') and (self.nCells is not None) and \
                 hasattr(self, 'cellIds') and (self.cellIds is not None):
             if self.nCells != len(self.cellIds):
-                mp_print("Number of cell-IDs ({}) stored in metadata, is not equal to value of nCells ({}). "
-                         "Check this! Now exiting.".format(len(self.cellIds), self.nCells), ERROR=True)
-                exit()
+                msg = ("Number of cell-IDs ({}) stored in metadata, is not equal to value of nCells ({}). "
+                       "Check this! Now exiting.".format(len(self.cellIds), self.nCells))
+                mp_print(msg, ERROR=True)
+                raise BonsaiError(msg)
 
     def to_dict(self):
         self_dict = self.__dict__
@@ -119,7 +117,7 @@ class Metadata:
         new_nGenes = len(genes_to_keep)
         if self.nGenes < new_nGenes:
             logger.error("Trying to take a subset of genes with more genes than original.")
-            exit()
+            raise BonsaiError("Trying to take a subset of genes with more genes than original.")
         elif self.nGenes > new_nGenes:
             self.geneIds = [self.geneIds[ind] for ind in genes_to_keep]
             if self.geneVariances is not None:
@@ -178,7 +176,7 @@ class SCData:
             return
         if not dataset:
             mp_print("Dataset-ID should be given.")
-            exit()
+            raise BonsaiError("Dataset-ID should be given.")
 
         self.metadata = Metadata()
         if results_folder and len(results_folder):
@@ -612,7 +610,10 @@ class SCData:
 
     # Should go to tree visualisation file
     def set_node_edge_style(self, style_type='default'):
-        from .helpers import custom_colors_rgba, gradient_colors, blackish, grey
+        from .helpers import _plot_colors
+        colors = _plot_colors()
+        custom_colors_rgba, gradient_colors, blackish, grey = (
+            colors['custom_colors_rgba'], colors['gradient_colors'], colors['blackish'], colors['grey'])
 
         counts = self.nCellsPerVert
         cnt_min, cnt_max = np.min(counts), np.max(counts)
@@ -1170,7 +1171,7 @@ class SCData:
             else:
                 # mp_print("WARNING: File {} not found.".format(self.data_path(filenameMeans)), WARNING=True)
                 # mp_print("WARNING: File {} not found.".format(self.data_path(filenameStds)), WARNING=True)
-                exit("Data-file was not found!")
+                raise BonsaiError("Data-file was not found!")
         if mpiInfo.rank != 0:
             return None, None
 
@@ -1184,14 +1185,16 @@ class SCData:
                     self.metadata.geneIds.append(row[0])
             if (n_genes_orig is not None) and (len(self.metadata.geneIds) != n_genes_orig):
                 print("Number of gene-Ids in file geneID.txt does not match number of features in data-matrix!")
-                exit()
+                raise BonsaiError("Number of gene-Ids in file geneID.txt does not match number of features "
+                                  "in data-matrix!")
         elif os.path.exists(self.data_path('log_transcription_quotients.txt')):
             geneIds = pd.read_csv(self.data_path('log_transcription_quotients.txt'), header=None, usecols=[0],
                                   sep='\t')[1:].values.flatten()
             self.metadata.geneIds = [ID for ID in geneIds]
             if (n_genes_orig is not None) and (len(self.metadata.geneIds) != n_genes_orig):
                 print("Number of gene-Ids in file log_transcription_quotients.txt does not match genes in data-matrix!")
-                exit()
+                raise BonsaiError("Number of gene-Ids in file log_transcription_quotients.txt does not match "
+                                  "genes in data-matrix!")
         else:
             mp_print("No geneID-file was found. Giving generic names.")
             if originalData.ltqs is None:
@@ -1214,12 +1217,13 @@ class SCData:
                 for row in reader:
                     cell_id = row[0]
                     if any(c in cell_id for c in forbidden):
-                        logger.error("At least one cell-ID: {} contains a character that is problematic for"
-                                     "writing and reading Nwk-strings: ':', ',' '(', ')',';'.\n"
-                                     "Please replace these characters, for example by underscores: '_'.\n"
-                                     "Note that you should also do these "
-                                     "replacements in potential annotation-files.".format(cell_id))
-                        exit()
+                        msg = ("At least one cell-ID: {} contains a character that is problematic for"
+                               "writing and reading Nwk-strings: ':', ',' '(', ')',';'.\n"
+                               "Please replace these characters, for example by underscores: '_'.\n"
+                               "Note that you should also do these "
+                               "replacements in potential annotation-files.".format(cell_id))
+                        logger.error(msg)
+                        raise BonsaiError(msg)
                         # if not warned:
                         #     logger.warning("At least one cell-ID: {} contains a character that is problematic for"
                         #                    "writing and reading Nwk-strings: ':', ',' '(', ')',';'.\n"
@@ -1231,12 +1235,12 @@ class SCData:
             n_unq_ids = len(np.unique(self.metadata.cellIds))
             if self.metadata.nCells is not None:
                 if (n_unq_ids != self.metadata.nCells) or (len(self.metadata.cellIds) != self.metadata.nCells):
-                    mp_print("Number of unique object-IDs given in {} does not "
-                             "match the number of columns in your feature"
-                             "matrix.\n "
-                             "Please resolve this and start Bonsai again.".format(self.data_path('cellID.txt')),
-                             ERROR=True)
-                    exit()
+                    msg = ("Number of unique object-IDs given in {} does not "
+                           "match the number of columns in your feature"
+                           "matrix.\n "
+                           "Please resolve this and start Bonsai again.".format(self.data_path('cellID.txt')))
+                    mp_print(msg, ERROR=True)
+                    raise BonsaiError(msg)
         else:
             mp_print("No cellID-file was found. Giving generic names.")
             if self.metadata.nCells is None:
@@ -1285,7 +1289,7 @@ class SCData:
             if self.umiCounts.shape[0] != self.metadata.nGenes:
                 self.throw_out_zeros()
                 if self.umiCounts.shape[0] != self.metadata.nGenes:
-                    exit("Umi-count file does not have the same number as genes as the rest of the data.")
+                    raise BonsaiError("Umi-count file does not have the same number as genes as the rest of the data.")
         except FileNotFoundError:
             print("Warning, not an error: No UMI-count file was found.")
             self.umiCounts = None
@@ -2624,13 +2628,15 @@ def load_data_for_tree(scData, tree_folder, vertind_to_node, get_all_data=True, 
                     print("Original data was not found, but is not strictly needed now. Will continue without it.")
                     data_found = False
                 else:
-                    exit("No data was found, please provide correct paths to where the original data is stored.")
+                    raise BonsaiError("No data was found, please provide correct paths to where the original data is stored.")
                 addDataToTree(scData, vertind_to_node)
                 if not keep_original_data:
                     scData.originalData = None
                 if data_found:
                     scData.metadata.loglik = scData.tree.calcLogLComplete(mem_friendly=True,
                                                                           loglikVarCorr=scData.metadata.loglikVarCorr)
+        except BonsaiError:
+            raise  # upstream's exit() (SystemExit) was never caught here; a converted BonsaiError must not be either
         except Exception as e:
             mp_print("Encountered exception '{}'".format(e), WARNING=True)
             if no_data_needed:
@@ -2717,7 +2723,7 @@ def get_cell_info_tree(scData, vertIndToNode):
         scData.csIndToVertInd = {}
         get_cs_info = True
         logger.error("I didn't think getting cs-info here would ever be necessary. Check why this happens.")
-        exit()
+        raise BonsaiError("I didn't think getting cs-info here would ever be necessary. Check why this happens.")
     else:
         get_cs_info = False
     nodeIdToVertInd = {node.nodeId: vertInd for vertInd, node in vertIndToNode.items()}
@@ -2737,9 +2743,10 @@ def get_cell_info_tree(scData, vertIndToNode):
             scData.cellIndToVertInd[ind] = vert_ind
 
     if len(cells_not_found):
-        mp_print("{}\n\n Could not find the above cells in the tree. "
-                 "Check this! Now exiting!".format(cells_not_found), ERROR=True)
-        exit()
+        msg = ("{}\n\n Could not find the above cells in the tree. "
+               "Check this! Now exiting!".format(cells_not_found))
+        mp_print(msg, ERROR=True)
+        raise BonsaiError(msg)
 
     scData.nCellsPerVert = np.zeros(scData.nVerts)
     scData.vertIndToCellInds = {ind: [] for ind in range(scData.nVerts)}
@@ -2762,8 +2769,7 @@ def infer_true_var_log(inferred_vals, inferred_vars):
                                                       args=(inferred_vals[ind, :], inferred_vars[ind, :]),
                                                       full_output=1, xtol=1.e-06)
         if ierr:
-            sys.exit("log_activities has not converged after %d iterations.\n"
-                     % numfunc)
+            raise BonsaiError("log_activities has not converged after %d iterations.\n" % numfunc)
         true_vars[ind] = np.exp(true_var_log)
 
     return true_vars
@@ -2829,8 +2835,9 @@ def read_and_filter(data_folder, meansfile, stdsfile, sanityOutput, zscoreCutoff
         meanspath = os.path.join(data_folder, meansfile)
         stdspath = os.path.join(data_folder, stdsfile) if (stdsfile is not None) else None
         if not os.path.exists(meanspath):
-            mp_print("Did not find necessary input-file: {}".format(meanspath), ERROR=True)
-            exit()
+            msg = "Did not find necessary input-file: {}".format(meanspath)
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
 
     # First determine the number of genes on process 0
     if mpiInfo.rank == 0:
@@ -2872,12 +2879,14 @@ def read_and_filter(data_folder, meansfile, stdsfile, sanityOutput, zscoreCutoff
             if len(gene_variances) != nGenesOrig:
                 print("Number of gene variances in file {} does not match number of features in the ltq-matrix.\n"
                       "Check this.".format(gene_variancepath))
-                exit()
+                raise BonsaiError("Number of gene variances in file {} does not match number of features in the "
+                                  "ltq-matrix.".format(gene_variancepath))
             gene_means = np.loadtxt(gene_meanspath)
             if len(gene_means) != nGenesOrig:
                 print("Number of gene means in file {} does not match number of features in the ltq-matrix.\n"
                       "Check this.".format(gene_meanspath))
-                exit()
+                raise BonsaiError("Number of gene means in file {} does not match number of features in the "
+                                  "ltq-matrix.".format(gene_meanspath))
 
             with open(meanspath, 'r') as fmeans:
                 with open(stdspath, 'r') as fstd:
@@ -3055,9 +3064,9 @@ def read_and_filter(data_folder, meansfile, stdsfile, sanityOutput, zscoreCutoff
                 continueYN = False
                 mpi_wrapper.bcast(continueYN, root=0)
                 if len(genes_to_keep) == 0:
-                    exit("No gene made the zscore-cutoff. Considering lowering the cutoff.")
+                    raise BonsaiError("No gene made the zscore-cutoff. Considering lowering the cutoff.")
                 else:
-                    exit("Only one gene made the zscore-cutoff. Considering lowering the zscore-cutoff.")
+                    raise BonsaiError("Only one gene made the zscore-cutoff. Considering lowering the zscore-cutoff.")
             continueYN = True
             mpi_wrapper.bcast(continueYN, root=0)
 
@@ -3068,13 +3077,13 @@ def read_and_filter(data_folder, meansfile, stdsfile, sanityOutput, zscoreCutoff
             continueOrBreak = None
             continueYN = mpi_wrapper.bcast(continueOrBreak, root=0)
             if not continueYN:
-                exit()
+                raise BonsaiError("Not enough genes made the zscore-cutoff (reported by the root process).")
 
     else:
         if ltqs.shape[0] == 0:
-            exit("Exiting: No gene made the zscore-cutoff. Consider lowering the cutoff.")
+            raise BonsaiError("Exiting: No gene made the zscore-cutoff. Consider lowering the cutoff.")
         elif ltqs.shape[0] == 1:
-            exit("Exiting: Only one gene made the zscore-cutoff. Consider lowering the cutoff.")
+            raise BonsaiError("Exiting: Only one gene made the zscore-cutoff. Consider lowering the cutoff.")
 
     """REPLACE FROM HERE!"""
     # if mpiInfo.size > 1:

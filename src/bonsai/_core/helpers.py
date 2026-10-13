@@ -1,10 +1,7 @@
 from argparse import ArgumentTypeError
 from . import mpi_wrapper
 import sys
-from matplotlib import cm
-from matplotlib.colors import ListedColormap
 import numpy as np
-import matplotlib.pyplot as plt
 import time
 from scipy import optimize
 from scipy.optimize import minimize
@@ -18,31 +15,47 @@ from datetime import datetime
 from collections import namedtuple
 from ruamel.yaml import YAML
 
-custom_colors = ['#d7191c', '#fdae61', '#abd9e9']
-custom_colors_rgb = [tuple(float(int(h.lstrip('#')[i:i + 2], 16)) / 255 for i in (0, 2, 4)) for h in custom_colors]
-custom_colors_rgba = [tuple(list(rgb) + [1.0]) for rgb in custom_colors_rgb]
-blackish = '#%02x%02x%02x' % (35, 31, 32)
-blackish = (0.08578431372549018, 0.08578428015768168, 0.11935208866155156, 1.0)
-grey_cmap = plt.get_cmap('gray')
-grey = grey_cmap(0.7)
-# celltype_colors = plt.get_cmap('tab10')
-other_colors = plt.get_cmap('tab20')
-# gradient_colors = plt.get_cmap('terrain')
-gradient_colors = plt.get_cmap('viridis')
+
+class BonsaiError(ValueError):
+    """Raised where upstream Bonsai stopped with exit()."""
+
+
+# The colors below are only used for plotting; matplotlib is imported lazily here (via _plot_colors()
+# and _plotting_setup()) so that `import bonsai` does not pull in matplotlib.
+def _plotting_setup():
+    """Import matplotlib and silence its logger. Only called by plotting functions."""
+    import matplotlib.pyplot as plt
+    plt.set_loglevel(level='warning')
+    return plt
+
+
+def _plot_colors():
+    """Matplotlib-dependent color constants, computed lazily so that importing bonsai does not load matplotlib."""
+    plt = _plotting_setup()
+    custom_colors = ['#d7191c', '#fdae61', '#abd9e9']
+    custom_colors_rgb = [tuple(float(int(h.lstrip('#')[i:i + 2], 16)) / 255 for i in (0, 2, 4)) for h in custom_colors]
+    custom_colors_rgba = [tuple(list(rgb) + [1.0]) for rgb in custom_colors_rgb]
+    blackish = '#%02x%02x%02x' % (35, 31, 32)
+    blackish = (0.08578431372549018, 0.08578428015768168, 0.11935208866155156, 1.0)
+    grey_cmap = plt.get_cmap('gray')
+    grey = grey_cmap(0.7)
+    # celltype_colors = plt.get_cmap('tab10')
+    other_colors = plt.get_cmap('tab20')
+    # gradient_colors = plt.get_cmap('terrain')
+    gradient_colors = plt.get_cmap('viridis')
+    return dict(custom_colors=custom_colors, custom_colors_rgb=custom_colors_rgb,
+                custom_colors_rgba=custom_colors_rgba, blackish=blackish, grey_cmap=grey_cmap, grey=grey,
+                other_colors=other_colors, gradient_colors=gradient_colors)
+
 
 import logging
 FORMAT = '%(asctime)s %(funcName)s %(levelname)s %(message)s'
 log_level = logging.WARNING
 log_level = logging.DEBUG
-logging.basicConfig(format=FORMAT,
-                    datefmt='%m-%d %H:%M:%S',
-                    level=logging.WARNING)   # silence all libraries
 
 # Create your app logger
 logger = logging.getLogger("myapp")
 logger.setLevel(log_level)
-
-plt.set_loglevel(level='warning')
 
 
 class Run_Configs:
@@ -89,7 +102,8 @@ class Run_Configs:
                   "'bonsai/config_template_do_not_change/config_template.yaml' "
                   "and insert the correct configuration there.\n"
                   "Then add the path to this YAML-file in the '--config_filepath' parameters")
-            exit()
+            raise BonsaiError("No YAML-file with run configurations found{}".format(
+                "." if yaml_filepath is None else " at {}".format(yaml_filepath)))
 
         for label in pars_defaults:
             if (label in self.config_yaml) and (self.config_yaml[label] is not None):
@@ -195,6 +209,8 @@ def mp_print(*args, **kwargs):
 
 # Should go to tree vis file
 def get_celltype_colors(n_celltypes, colortype=None, gradientType='hsv'):
+    plt = _plotting_setup()
+    from matplotlib.colors import ListedColormap
     if (colortype is None) and (n_celltypes <= 8):
         col_HSC = "#0B5345"  # darkgreen
         col_MPP = "#229954"  # green
@@ -234,7 +250,7 @@ def get_celltype_colors(n_celltypes, colortype=None, gradientType='hsv'):
     elif colortype == 'offOn':
         tab10 = plt.get_cmap('tab10')
         two_colors = tab10([1, 2])
-        two_colors[1, :] = grey_cmap(0.5)
+        two_colors[1, :] = _plot_colors()['grey_cmap'](0.5)
         celltype_colors = ListedColormap(two_colors)
     else:
         gradient = plt.get_cmap(gradientType)
@@ -289,6 +305,7 @@ def invert_coords_poincare(coords, origin=np.zeros(2), zoom=1, no_transform=Fals
 def pause_anim(t):  # This is taken from plt.pause(...), but without unnecessary
     # stuff. Note that the time module should be previously imported.
     # Again, this use the controversial event_loop of Matplotlib.
+    plt = _plotting_setup()
     backend = plt.rcParams['backend']
     if backend in plt._interactive_bk:
         figManager = plt._pylab_helpers.Gcf.get_active()
@@ -1277,32 +1294,37 @@ def resolve_sanity_filepaths(data_folder):
     if new_sanity:
         version, method = parse_sanity_command_file(command_path)
         if version is None:
-            mp_print("Could not read the Sanity-version from {}.\n"
-                     "Expected a line of the form '# Sanity version: 2.0.0'.".format(command_path), ERROR=True)
-            exit()
+            msg = ("Could not read the Sanity-version from {}.\n"
+                   "Expected a line of the form '# Sanity version: 2.0.0'.".format(command_path))
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
         if version < SANITY_MINIMUM_VERSION:
-            mp_print("The Sanity-output in {} was made with Sanity-version {}, but Bonsai needs at least Sanity-version"
-                     " {}.\nPlease update Sanity (https://github.com/jmbreda/Sanity) and rerun "
-                     "it.".format(data_folder, '.'.join(map(str, version)),
-                                  '.'.join(map(str, SANITY_MINIMUM_VERSION))), ERROR=True)
-            exit()
+            msg = ("The Sanity-output in {} was made with Sanity-version {}, but Bonsai needs at least Sanity-version"
+                   " {}.\nPlease update Sanity (https://github.com/jmbreda/Sanity) and rerun "
+                   "it.".format(data_folder, '.'.join(map(str, version)),
+                                '.'.join(map(str, SANITY_MINIMUM_VERSION))))
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
         if method is None:
-            mp_print("Could not read the variance-estimation method from {}.\n"
-                     "Expected a line of the form '# Method: MAP'.".format(command_path), ERROR=True)
-            exit()
+            msg = ("Could not read the variance-estimation method from {}.\n"
+                   "Expected a line of the form '# Method: MAP'.".format(command_path))
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
         if method in SANITY_REJECTED_METHODS:
-            mp_print("The Sanity-output in {} was made with the variance-estimation method '{}'.\n"
-                     "Bonsai cannot use Sanity that was run with '-v_m MARG' as input, since that marginalises over "
-                     "the gene-variance, so that the reported estimates are not a likelihood that Bonsai can "
-                     "reconstruct.\nPlease rerun Sanity with its default method, '-v_m MAP'. Use '-v_m MLE' instead if "
-                     "you want to reproduce the output of Sanity-versions older than "
-                     "2.0.".format(data_folder, method), ERROR=True)
-            exit()
+            msg = ("The Sanity-output in {} was made with the variance-estimation method '{}'.\n"
+                   "Bonsai cannot use Sanity that was run with '-v_m MARG' as input, since that marginalises over "
+                   "the gene-variance, so that the reported estimates are not a likelihood that Bonsai can "
+                   "reconstruct.\nPlease rerun Sanity with its default method, '-v_m MAP'. Use '-v_m MLE' instead if "
+                   "you want to reproduce the output of Sanity-versions older than "
+                   "2.0.".format(data_folder, method))
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
         if method not in SANITY_ACCEPTED_METHODS:
-            mp_print("The Sanity-output in {} was made with the variance-estimation method '{}', which Bonsai does not "
-                     "know.\nBonsai can use Sanity-output made with any of these methods: {}.".format(
-                         data_folder, method, ', '.join(SANITY_ACCEPTED_METHODS)), ERROR=True)
-            exit()
+            msg = ("The Sanity-output in {} was made with the variance-estimation method '{}', which Bonsai does not "
+                   "know.\nBonsai can use Sanity-output made with any of these methods: {}.".format(
+                       data_folder, method, ', '.join(SANITY_ACCEPTED_METHODS)))
+            mp_print(msg, ERROR=True)
+            raise BonsaiError(msg)
         filenames = SANITY_FILENAMES
     else:
         filenames = SANITY_LEGACY_FILENAMES
@@ -1313,20 +1335,21 @@ def resolve_sanity_filepaths(data_folder):
         for missing_path in missing_paths:
             mp_print("File {} not found.".format(missing_path), WARNING=True)
         if new_sanity:
-            mp_print("Could not find all Sanity-output that Bonsai needs in {}.\n"
-                     "Make sure to run Sanity with the extended-output flag '-e 1'.".format(data_folder), ERROR=True)
+            msg = ("Could not find all Sanity-output that Bonsai needs in {}.\n"
+                   "Make sure to run Sanity with the extended-output flag '-e 1'.".format(data_folder))
         elif os.path.exists(os.path.join(data_folder, SANITY_FILENAMES['means'])):
-            mp_print("Only found {}, not {}.\n"
-                     "Make sure to run Sanity with the argument '-max_v only_max_output'. When using Sanity 2.0 or "
-                     "newer, run it with '-e 1 -v_m MAP' instead.".format(SANITY_FILENAMES['means'],
-                                                                          SANITY_LEGACY_FILENAMES['means']), ERROR=True)
+            msg = ("Only found {}, not {}.\n"
+                   "Make sure to run Sanity with the argument '-max_v only_max_output'. When using Sanity 2.0 or "
+                   "newer, run it with '-e 1 -v_m MAP' instead.".format(SANITY_FILENAMES['means'],
+                                                                        SANITY_LEGACY_FILENAMES['means']))
         else:
-            mp_print("Could not find (the right) Sanity-output.\n"
-                     "Are you sure the argument --input_is_sanity_output should be set to True?"
-                     "\nAre you sure you are running Sanity with the extended-output flag '-e 1', "
-                     "and the vmax-argument '-max_v true'? When using Sanity 2.0 or newer, run it with "
-                     "'-e 1 -v_m MAP' instead.", ERROR=True)
-        exit()
+            msg = ("Could not find (the right) Sanity-output.\n"
+                   "Are you sure the argument --input_is_sanity_output should be set to True?"
+                   "\nAre you sure you are running Sanity with the extended-output flag '-e 1', "
+                   "and the vmax-argument '-max_v true'? When using Sanity 2.0 or newer, run it with "
+                   "'-e 1 -v_m MAP' instead.")
+        mp_print(msg, ERROR=True)
+        raise BonsaiError(msg)
     return filepaths
 
 

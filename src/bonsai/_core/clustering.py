@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import sys
 from .cluster_helpers import Cluster_Tree, entropy_non_norm
-from .helpers import mp_print
+from .helpers import mp_print, BonsaiError
 from itertools import combinations
 import random
 from collections import defaultdict
@@ -692,9 +692,10 @@ def get_annotation_based_clustering_random(cluster_tree, annotation_dict, cell_i
         ds_node = max_node
         if max_node.parentNode is None:
             if max_node.old_parent_node is None:
-                mp_print("Something went terribly wrong. Node doesn't have parent, and no former parent, "
-                         "and was still selected in clustering. Check this.", ERROR=True)
-                exit()
+                msg = ("Something went terribly wrong. Node doesn't have parent, and no former parent, "
+                       "and was still selected in clustering. Check this.")
+                mp_print(msg, ERROR=True)
+                raise BonsaiError(msg)
 
             # In this case, we do not create a new tree, but rather merge two trees
             us_node = max_node.old_parent_node
@@ -851,9 +852,9 @@ def get_annotation_based_clustering_random(cluster_tree, annotation_dict, cell_i
             adjusted_rand_index = adjusted_rand_score(np.array(labels_true), np.array(labels_pred))
             print(nmi_test, max_new_mut_info)
             if abs(max_new_mut_info - nmi_test) > 1e-9:
-                mp_print("Predicted mutual information deviates from independently calculated mut.info."
-                         "Check this!", ERROR=True)
-                exit()
+                msg = "Predicted mutual information deviates from independently calculated mut.info.Check this!"
+                mp_print(msg, ERROR=True)
+                raise BonsaiError(msg)
 
             if tracking_path is not None:
                 stats[-1].update({"adjusted_mut_info": adjusted_mut_info,

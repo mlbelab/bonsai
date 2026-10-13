@@ -12,6 +12,7 @@ import pytest
 from bonsai._core.helpers import (
     SANITY_FILENAMES,
     SANITY_LEGACY_FILENAMES,
+    BonsaiError,
     parse_sanity_command_file,
     parse_version_string,
     resolve_sanity_filepaths,
@@ -72,14 +73,14 @@ def test_legacy_sanity_output_resolves_to_vmax_files(tmp_path):
 def test_legacy_sanity_output_without_vmax_files_is_rejected(tmp_path, caplog):
     """Sanity older than 2.0 run without '-max_v' leaves only the plain filenames, which Bonsai cannot use."""
     data_folder = make_sanity_folder(tmp_path, SANITY_FILENAMES.values())
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "-max_v only_max_output" in caplog.text
 
 
 def test_empty_folder_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(tmp_path, [])
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "--input_is_sanity_output" in caplog.text
 
@@ -99,7 +100,7 @@ def test_marginalising_method_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(
         tmp_path, SANITY_FILENAMES.values(), COMMAND_TEMPLATE.format(version="2.0.0", method="MARG")
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "-v_m MAP" in caplog.text
 
@@ -108,7 +109,7 @@ def test_unknown_method_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(
         tmp_path, SANITY_FILENAMES.values(), COMMAND_TEMPLATE.format(version="2.0.0", method="SOMETHING_NEW")
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "SOMETHING_NEW" in caplog.text
 
@@ -118,7 +119,7 @@ def test_too_old_version_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(
         tmp_path, SANITY_FILENAMES.values(), COMMAND_TEMPLATE.format(version="1.9", method="MLE")
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "1.9" in caplog.text
 
@@ -127,7 +128,7 @@ def test_unreadable_version_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(
         tmp_path, SANITY_FILENAMES.values(), "# Timestamp: 2026-08-07 10:42:37\n# Method: MLE\n"
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "Sanity version" in caplog.text
 
@@ -136,7 +137,7 @@ def test_missing_method_is_rejected(tmp_path, caplog):
     data_folder = make_sanity_folder(
         tmp_path, SANITY_FILENAMES.values(), "# Timestamp: 2026-08-07 10:42:37\n# Sanity version: 2.0.0\n"
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "Method" in caplog.text
 
@@ -144,6 +145,6 @@ def test_missing_method_is_rejected(tmp_path, caplog):
 def test_new_sanity_output_without_extended_output_is_rejected(tmp_path, caplog):
     """Without '-e 1', Sanity 2.0 only writes the log-transcription-quotients, not the files Bonsai needs."""
     data_folder = make_sanity_folder(tmp_path, ["delta.txt"], COMMAND_TEMPLATE.format(version="2.0.0", method="MAP"))
-    with pytest.raises(SystemExit):
+    with pytest.raises(BonsaiError):
         resolve_sanity_filepaths(data_folder)
     assert "-e 1" in caplog.text
