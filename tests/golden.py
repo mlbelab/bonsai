@@ -1,6 +1,7 @@
 """Compare a Bonsai result folder with the golden upstream reference."""
 
 import re
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 
@@ -49,10 +50,22 @@ def load_tree(folder: Path) -> Tree:
     return Tree(clades, lengths, float(meta.loc["metadata", "finalLoglik"]))  # type: ignore[arg-type]
 
 
+_EXTRA_FILES = ("edgeInfo.txt", "vertInfo.txt", "posterior_ltqs_vertByGene.npy", "posterior_ltqsVars_vertByGene.npy")
+
+
+def _assert_extra_files_bitwise(got: Path, golden: Path) -> None:
+    """Byte-for-byte comparison of the other result files, where present in both folders."""
+    for name in _EXTRA_FILES:
+        g, b = got / name, golden / name
+        if g.exists() and b.exists():
+            assert g.read_bytes() == b.read_bytes(), f"{name} differs from upstream golden result (bitwise path)"
+
+
 def assert_trees_match(got: Path, golden: Path = GOLDEN) -> None:
     a, b = load_tree(got), load_tree(golden)
     assert a.clades == b.clades, "topology differs from upstream golden tree"
     if (got / "tree.nwk").read_bytes() == (golden / "tree.nwk").read_bytes() and a.loglik == b.loglik:
+        _assert_extra_files_bitwise(got, golden)
         return  # bitwise identical: expected on the reference platform
     # Cross-platform (other BLAS/libm): the final stage is Tree.optTimes (tree_helpers.py:3463-3465),
     # scipy L-BFGS-B with tol=1e-6, i.e. ftol=1e-6: it stops once the relative decrease of -loglik per
@@ -61,8 +74,9 @@ def assert_trees_match(got: Path, golden: Path = GOLDEN) -> None:
     # relative -> 10*sqrt(ftol).
     # The final call (main.py:430) passes maxiter=100, so the ftol bound above only holds if that call
     # converges before hitting maxiter (as it does for this fixture); a maxiter-capped run could differ
-    # by more than these tolerances. `Tree.test_for_zero_times` (main.py:433) runs right after it and
+    # by more than these tolerances. `Tree.test_for_zero_times` (main.py:432) runs right after it and
     # may snap near-zero optimised times to exactly 0, which does not reopen the ftol argument above.
+    warnings.warn("golden: tolerance path taken (not bitwise-identical to the golden reference)", stacklevel=2)
     FTOL = 1e-6
     LOGLIK_RTOL = 10 * FTOL
     T_RTOL = 10 * FTOL**0.5

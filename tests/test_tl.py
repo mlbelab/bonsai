@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import anndata
@@ -68,6 +69,27 @@ def test_read_results_missing_cell_leaves_adata_untouched():
     assert "bonsai_node" not in a.obs
 
 
+def test_read_results_cell_named_na(tmp_path):
+    """A cell literally named 'NA' must stay a string through vertInfo.txt/metadata.json/tree.nwk,
+    not get turned into NaN by pandas' default NA sniffing (mutant: drop keep_default_na=False)."""
+    import shutil
+
+    dest = tmp_path / "golden"
+    shutil.copytree(GOLDEN, dest)
+    old_name = "Cell011001"
+    (dest / "vertInfo.txt").write_text((dest / "vertInfo.txt").read_text().replace(old_name, "NA"))
+    (dest / "tree.nwk").write_text((dest / "tree.nwk").read_text().replace(old_name, "NA"))
+    meta_path = dest / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    meta["cellIds"] = [("NA" if c == old_name else c) for c in meta["cellIds"]]
+    meta_path.write_text(json.dumps(meta))
+
+    a = bonsai.io.read_results(dest)
+    assert "NA" in set(a.obs_names)
+    assert a.uns["bonsai"]["nodes"]["name"].isna().sum() == 0
+    assert "NA" in set(a.uns["bonsai"]["nodes"]["name"])
+
+
 def test_node_posteriors_needs_workdir():
     a = bonsai.io.read_results(GOLDEN)
     a.uns["bonsai"]["workdir"] = None
@@ -130,10 +152,26 @@ def test_reserved_cell_names_rejected(name, tmp_path):
         bonsai.tl.reconstruct(a, workdir=tmp_path / "wd")
 
 
+def test_gene_name_with_colon_accepted(tmp_path, monkeypatch):
+    """Gene names are not newick labels: 'chr1:100-200' (unlike a cell name) is fine."""
+    import shutil
+
+    from ruamel.yaml import YAML
+
+    def fake_run(cfg):
+        results = Path(YAML().load(Path(cfg).read_text())["results_folder"])
+        shutil.copytree(GOLDEN, results / "final_bonsai_zscore1.0")
+
+    a = bonsai.pp.read_sanity(FIXTURE)
+    a.var_names = ["chr1:100-200"] + list(a.var_names[1:])
+    monkeypatch.setattr(bonsai.tl, "run_from_config", fake_run)
+    bonsai.tl.reconstruct(a, workdir=tmp_path / "wd")  # must not raise
+
+
 def test_bad_gene_name_rejected_through_reconstruct(tmp_path):
     a = bonsai.pp.read_sanity(FIXTURE)[:5].copy()
-    a.var_names = ["a:b"] + list(a.var_names[1:])
-    with pytest.raises(ValueError, match="name"):
+    a.var_names = ["a\tb"] + list(a.var_names[1:])
+    with pytest.raises(ValueError, match="tab or newline"):
         bonsai.tl.reconstruct(a, workdir=tmp_path / "wd")
 
 

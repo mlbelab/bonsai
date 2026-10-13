@@ -4,7 +4,6 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -15,22 +14,29 @@ from . import io
 from ._core.main import run_from_config
 from ._io_folder import write_data_folder
 
-_BAD_NAME = re.compile(r"[\s(),:;]")
+_BAD_CELL_NAME = re.compile(r"[\s(),:;]")
+_BAD_GENE_NAME = re.compile(r"[\t\n]")
 _RESERVED_CELL_NAME = re.compile(r"^(root|internal_\d+)$")
 
 
 def _check_names(names, what):
     if not names.is_unique:
         raise ValueError(f"{what} names must be unique")
-    bad = [n for n in names if _BAD_NAME.search(str(n))]
+    if what == "gene":
+        # Genes are never newick labels (they only index per-gene TSV columns), so only a
+        # tab/newline (which would corrupt that TSV) is refused; see docs/deviations.md.
+        bad = [n for n in names if _BAD_GENE_NAME.search(str(n))]
+        if bad:
+            raise ValueError(f"gene name {bad[0]!r} contains a tab or newline")
+        return
+    bad = [n for n in names if _BAD_CELL_NAME.search(str(n))]
     if bad:
         raise ValueError(f"{what} name {bad[0]!r} contains whitespace or one of '(),:;'")
-    if what == "cell":
-        reserved = [n for n in names if _RESERVED_CELL_NAME.match(str(n))]
-        if reserved:
-            raise ValueError(
-                f"cell name {reserved[0]!r} collides with upstream's internal vertex names ('root', 'internal_<n>')"
-            )
+    reserved = [n for n in names if _RESERVED_CELL_NAME.match(str(n))]
+    if reserved:
+        raise ValueError(
+            f"cell name {reserved[0]!r} collides with upstream's internal vertex names ('root', 'internal_<n>')"
+        )
 
 
 def reconstruct(
@@ -50,16 +56,74 @@ def reconstruct(
 ) -> AnnData | None:
     """Reconstruct the maximum-likelihood Bonsai tree (upstream algorithm, unchanged).
 
-    Parameters mirror the upstream YAML config (defaults = upstream template defaults).
-    Writes ``uns["bonsai"]``, ``obs["bonsai_node"]`` and ``var["bonsai_used"]``.
+    Parameters mirror the upstream YAML config (defaults = upstream template defaults). Needs
+    ``adata.uns["bonsai_input"]`` set by :func:`bonsai.pp.read_sanity` or
+    :func:`bonsai.pp.from_arrays`.
 
     Validation order (before anything is written): cell count, then cell/gene names, then
-    workdir emptiness.
+    workdir emptiness, then input layers/columns (``bonsai._io_folder.validate_inputs``).
+
+    The work directory holds Bonsai's inputs and outputs as plain text: roughly
+    ``2 * n_cells * n_genes`` numeric values for the mean/SD matrices alone, plus upstream's own
+    intermediate and result files. At 100k cells x 5k genes this is tens of GB. Pass ``workdir=``
+    on a filesystem with enough free space, or point ``TMPDIR`` there before calling with
+    ``workdir=None``.
+
+    Parameters
+    ----------
+    adata
+        Cells x genes; ``adata.uns["bonsai_input"]`` must already be set.
+    zscore_cutoff
+        Genes are used only if their z-scored prior variance exceeds this cutoff.
+    rescale_by_var
+        Rescale each gene by its prior variance before the knn/SPR search.
+    use_knn
+        Number of nearest neighbours used when building the initial tree.
+    UB_ellipsoid_size
+        Size of the confidence ellipsoid used for the upper bound on branch lengths.
+    nnn_n_randommoves
+        Number of random moves tried per nearest-neighbour-interchange (NNI) round.
+    nnn_n_randomtrees
+        Number of random starting trees for the NNI search.
+    spr_strategy
+        Upstream SPR candidate/target selection strategy (``"large_tree"``, ``"long_branch_sorted"``
+        or ``"super_sure"``; see ``_core/dataprocessing.py:do_spr_moveset``).
+    verbose
+        Forwarded to upstream as ``args.verbose``; only gates extra ``mp_print``/logging calls, not
+        any decision (see ``docs/deviations.md``). Default differs from the upstream config
+        template's default of ``True``.
+    workdir
+        Directory for inputs/intermediate/output files. If ``None`` (default), a temporary
+        directory is created and removed again unless ``keep_workdir=True``. If given and it
+        already exists, it must be empty.
+    keep_workdir
+        If ``True``, keep ``workdir`` (resolved to an absolute path in
+        ``adata.uns["bonsai"]["workdir"]``) after the run; needed by
+        :func:`node_posteriors`. If ``False`` (default), the directory (or just the files written
+        into a pre-existing one) is removed, even if the run raised.
+    copy
+        If ``True``, operate on and return a copy of ``adata``, leaving the original untouched. If
+        ``False`` (default), ``adata`` is modified in place and ``None`` is returned.
+
+    Returns
+    -------
+    The modified (or copied) AnnData if ``copy=True``, else ``None``. On success, writes
+    ``uns["bonsai"]`` (newick, edges, nodes, loglik, genes_used, config, workdir),
+    ``obs["bonsai_node"]`` (vertInd of each cell) and ``var["bonsai_used"]`` (genes that passed
+    ``zscore_cutoff``).
+
+    Raises
+    ------
+    ValueError
+        Fewer than 3 cells; a duplicate, reserved or otherwise invalid cell/gene name (see
+        ``_check_names``); a non-empty pre-existing ``workdir``; or an invalid/missing input layer
+        or column (``bonsai._io_folder.validate_inputs``).
     """
     if adata.n_obs < 3:
         raise ValueError("need at least 3 cells")
     _check_names(adata.obs_names, "cell")
     _check_names(adata.var_names, "gene")
+    adata = adata.copy() if copy else adata  # before any directory is created, so a failing copy leaves nothing behind
     tmp = workdir is None
     if tmp:
         wd = Path(tempfile.mkdtemp(prefix="bonsai_"))
@@ -70,7 +134,6 @@ def reconstruct(
         existed = wd.exists()
         if existed and any(wd.iterdir()):
             raise ValueError(f"workdir {wd} exists and is not empty")
-    adata = adata.copy() if copy else adata
     try:
         config = {
             "dataset": "bonsai",
@@ -93,7 +156,7 @@ def reconstruct(
         run_from_config(cfg)
         io.read_results(wd / "results", adata)
         adata.uns["bonsai"]["config"] = config
-        adata.uns["bonsai"]["workdir"] = str(wd) if keep_workdir else None
+        adata.uns["bonsai"]["workdir"] = str(wd.resolve()) if keep_workdir else None
     finally:
         if not keep_workdir:
             if existed:
@@ -108,18 +171,41 @@ def reconstruct(
 def node_posteriors(adata: AnnData) -> AnnData:
     """Posterior means/variances for every tree node (obs = nodes, var = genes used).
 
-    Reads the files upstream wrote; requires ``reconstruct(..., keep_workdir=True)``.
+    Reads ``posterior_ltqs_vertByGene.npy``/``posterior_ltqsVars_vertByGene.npy`` that upstream
+    already wrote into the kept work directory; it does not recompute them.
+
+    Parameters
+    ----------
+    adata
+        An AnnData produced by :func:`reconstruct(..., keep_workdir=True) <reconstruct>` (or by
+        :func:`bonsai.io.read_results` on such a kept results folder, with
+        ``uns["bonsai"]["workdir"]`` still pointing at it).
+
+    Returns
+    -------
+    AnnData with one row per tree node (``obs`` indexed by node name, ordered by ``vertInd``) and
+    one column per gene used by the reconstruction (``var_names`` = ``uns["bonsai"]["genes_used"]``,
+    in the ``.npy`` column order). ``X`` holds posterior means; ``layers["var"]`` holds posterior
+    variances.
+
+    Raises
+    ------
+    ValueError
+        ``adata.uns["bonsai"]["workdir"]`` is missing/falsy, or ``nodes["vertInd"]`` is not a
+        ``0..n-1`` permutation (so it cannot be used to align rows to the ``.npy`` files).
     """
     wd = adata.uns.get("bonsai", {}).get("workdir")
     if not wd:
         raise ValueError("node posteriors need the work directory: run reconstruct(..., keep_workdir=True)")
     final = io._final_folder(Path(wd) / "results")
-    nodes = adata.uns["bonsai"]["nodes"]
-    var = cast(pd.DataFrame, adata.var)  # in-memory AnnData: var is always a DataFrame, never Dataset2D
+    nodes = adata.uns["bonsai"]["nodes"].sort_values("vertInd")
+    if not (nodes["vertInd"].to_numpy() == np.arange(len(nodes))).all():
+        raise ValueError("nodes['vertInd'] is not a 0..n-1 permutation; cannot align to the .npy row order")
+    genes_used = adata.uns["bonsai"]["genes_used"]
     out = AnnData(
         X=np.load(final / "posterior_ltqs_vertByGene.npy"),
         obs=nodes.set_index(nodes["name"].astype(str)),
-        var=var.loc[var["bonsai_used"].to_numpy(), []],
+        var=pd.DataFrame(index=pd.Index(genes_used, dtype=object)),
     )
     out.layers["var"] = np.load(final / "posterior_ltqsVars_vertByGene.npy")
     return out

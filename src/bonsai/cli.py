@@ -51,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="REMOVE LATER! Only for debugging, string given here should give path to annotation-folder.",
     )
-    sub.add_parser("config", add_help=False)  # forwards remaining args to _core.config.main
+    sub.add_parser(
+        "config", add_help=False, help="Create or inspect a Bonsai YAML config file (forwards to upstream's CLI)."
+    )  # forwards remaining args to _core.config.main
     args, rest = parser.parse_known_args(argv)
     logging.basicConfig(format=FORMAT, datefmt="%m-%d %H:%M:%S", level=logging.WARNING)
     # upstream's own "myapp" logger ended up at DEBUG (its WARNING default is immediately

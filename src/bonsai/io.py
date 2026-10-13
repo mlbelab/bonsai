@@ -20,15 +20,47 @@ def _final_folder(folder: Path) -> Path:
 def read_results(folder: str | Path, adata: AnnData | None = None) -> AnnData:
     """Load a Bonsai result folder into ``uns["bonsai"]``, ``obs["bonsai_node"]``, ``var["bonsai_used"]``.
 
-    Without ``adata``, returns a new AnnData with the result's cells (obs) and used genes (var).
-
     Note: ``edgeInfo.txt`` branch lengths are written upstream with 9 significant digits
     (``%.8e``); ``tree.nwk`` carries full precision. Consumers wanting exact lengths should
     parse the newick rather than ``uns["bonsai"]["edges"]["t"]``.
+
+    Parameters
+    ----------
+    folder
+        A results folder, either a ``final_bonsai_*`` folder directly (detected by the presence of
+        ``vertInfo.txt``) or its parent (containing exactly one ``final_bonsai_*`` subfolder).
+    adata
+        If given, the result is attached to this AnnData in place (and it is also returned); its
+        ``obs_names`` must all be present among the result's cell names. If ``None`` (default), a
+        new AnnData is created from the result's own cell/gene lists
+        (``metadata.json["cellIds"]``/``["geneIds"]``).
+
+    Returns
+    -------
+    The (possibly newly created) AnnData, with:
+
+    - ``uns["bonsai"]``: ``newick``, ``edges`` (DataFrame: parent, child, t), ``nodes`` (DataFrame:
+      vertInd, name), ``loglik``, ``genes_used``, ``upstream_commit``.
+    - ``obs["bonsai_node"]``: each cell's ``vertInd``.
+    - ``var["bonsai_used"]``: whether each gene is in ``genes_used``.
+
+    Raises
+    ------
+    ValueError
+        ``folder`` is not a result folder and does not contain exactly one ``final_bonsai_*``
+        subfolder, or ``adata.obs_names`` has cells missing from the result's ``vertInfo.txt``
+        (in which case ``adata`` is left unmodified: no ``uns``/``obs``/``var`` keys are set).
     """
     final = _final_folder(Path(folder))
     meta = json.loads((final / "metadata.json").read_text())
-    nodes = pd.read_csv(final / "vertInfo.txt", sep="\t")[["vertInd", "vertName"]].rename(columns={"vertName": "name"})
+    # keep_default_na=False: cell/gene names like "NA", "NaN", "null" must stay strings, not become NaN.
+    nodes = pd.read_csv(
+        final / "vertInfo.txt",
+        sep="\t",
+        keep_default_na=False,
+        na_values=[],
+        dtype={"vertName": str},
+    )[["vertInd", "vertName"]].rename(columns={"vertName": "name"})
     edges = pd.read_csv(final / "edgeInfo.txt", sep="\t", header=None, names=["parent", "child", "t"])
     raw_loglik = pd.read_csv(final / "metadata_bonsai.txt", index_col=0).loc["metadata", "finalLoglik"]
     loglik = float(cast(SupportsFloat, raw_loglik))
