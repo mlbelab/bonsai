@@ -1,12 +1,9 @@
 # bonsai
 
 [![PyPI][badge-pypi]][link-pypi]
-[![Codecov][badge-codecov]][link-codecov]
 
 [badge-pypi]: https://img.shields.io/pypi/v/bonsai.svg
 [link-pypi]: https://pypi.org/project/bonsai
-[badge-codecov]: https://codecov.io/gh/mlbelab/bonsai/branch/main/graph/badge.svg
-[link-codecov]: https://codecov.io/gh/mlbelab/bonsai
 
 An [scverse](https://scverse.org)/[AnnData](https://anndata.readthedocs.io)-compatible package for
 *Bonsai*, the Bayesian maximum-likelihood cell-tree reconstruction method of de Groot et al. This
@@ -164,9 +161,9 @@ See [`CITATION.cff`](https://github.com/mlbelab/bonsai/blob/main/CITATION.cff).
 
 [scverse-discourse]: https://discourse.scverse.org/
 [issue-tracker]: https://github.com/mlbelab/bonsai/issues
-[changelog]: https://bonsai.readthedocs.io/en/latest/changelog.html
-[link-docs]: https://bonsai.readthedocs.io
-[link-api]: https://bonsai.readthedocs.io/en/latest/api.html
+[changelog]: https://github.com/mlbelab/bonsai/blob/main/docs/changelog.md
+[link-docs]: https://github.com/mlbelab/bonsai/tree/main/docs
+[link-api]: https://github.com/mlbelab/bonsai/blob/main/docs/api.md
 [upstream]: https://github.com/dhdegroot/Bonsai-data-representation
 [upstream-scout]: https://github.com/dhdegroot/Bonsai-data-representation#bonsai-scout-visualizing-the-bonsai-results
 [deviations]: https://github.com/mlbelab/bonsai/blob/main/docs/deviations.md
