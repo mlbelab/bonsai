@@ -12,11 +12,12 @@ optimising all times at once in log-space via logLGradStarTreeLogT. Both
 should reach the same log-likelihood, and that log-likelihood should match
 getLoglikAndGradStarTree computed independently from the returned times.
 """
+
 import numpy as np
 import pytest
 
-import bonsai.bonsai_globals as bs_glob
-from bonsai.bonsai_treeHelpers import getLoglikAndGradStarTree, logLGradStarTreeLogT, optimiseTStar
+import bonsai._core.globals as bs_glob
+from bonsai._core.tree_helpers import getLoglikAndGradStarTree, logLGradStarTreeLogT, optimiseTStar
 
 
 @pytest.fixture(autouse=True)

@@ -4,11 +4,12 @@ repeated noisy measurements (each with its own known measurement-error
 variance) -- a per-cell-type/per-batch mean estimate plus its variance,
 regressed onto a shared underlying variance v.
 """
+
 import numpy as np
 import pytest
 from scipy.optimize import minimize
 
-from bonsai.bonsai_dataprocessing import (
+from bonsai._core.dataprocessing import (
     infer_true_var_log,
     loglik_given_true_var_log,
     neg_loglik_grad_using_measurements_and_errors,
@@ -40,8 +41,7 @@ def test_mean_ml_is_the_precision_weighted_average():
     variances = rng.uniform(0.1, 1.0, n)
     logv = 0.4
 
-    _, _, mean_ml = neg_loglik_grad_using_measurements_and_errors(logv, measurements, variances,
-                                                                   return_mean_ML=True)
+    _, _, mean_ml = neg_loglik_grad_using_measurements_and_errors(logv, measurements, variances, return_mean_ML=True)
 
     v = np.exp(logv)
     precision = 1 / (v + variances)
@@ -55,8 +55,7 @@ def test_mean_ml_reduces_to_plain_mean_when_variances_are_equal():
     measurements = rng.normal(size=n)
     variances = np.full(n, 0.3)
 
-    _, _, mean_ml = neg_loglik_grad_using_measurements_and_errors(0.0, measurements, variances,
-                                                                   return_mean_ML=True)
+    _, _, mean_ml = neg_loglik_grad_using_measurements_and_errors(0.0, measurements, variances, return_mean_ML=True)
 
     assert mean_ml == pytest.approx(np.mean(measurements))
 
@@ -87,8 +86,9 @@ def test_mle_of_v_differs_between_the_two_objectives():
     variances = rng.uniform(0.1, 1.0, n)
     measurements = true_mu + rng.normal(scale=np.sqrt(true_v + variances))
 
-    opt_live = minimize(neg_loglik_grad_using_measurements_and_errors, x0=0.0, jac=True,
-                         args=(measurements, variances, False))
+    opt_live = minimize(
+        neg_loglik_grad_using_measurements_and_errors, x0=0.0, jac=True, args=(measurements, variances, False)
+    )
     v_live = np.exp(opt_live.x[0])
     v_dead = infer_true_var_log(measurements[None, :], variances[None, :])[0]
 
@@ -106,8 +106,7 @@ def test_infer_true_var_log_matches_grid_search_per_gene():
 
     logv_grid = np.linspace(-8, 8, 4001)
     for gene_ind in range(2):
-        grid_vals = [loglik_given_true_var_log(lv, measurements[gene_ind], variances[gene_ind])
-                     for lv in logv_grid]
+        grid_vals = [loglik_given_true_var_log(lv, measurements[gene_ind], variances[gene_ind]) for lv in logv_grid]
         expected_v = np.exp(logv_grid[np.argmin(grid_vals)])
         assert fitted[gene_ind] == pytest.approx(expected_v, rel=1e-2)
 

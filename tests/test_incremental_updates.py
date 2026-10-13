@@ -7,19 +7,20 @@ message-passing sum over *all* children from scratch:
     add_contrib_ltqs        -- add one child's contribution to a parent
     getLtqsAfterChildUpdate -- swap one child's contribution for another's, in one step
 
-Note: subtract_contrib_ltqs and add_contrib_ltqs take the parent's 
-*precision* (W) as input but return the parent's *variance* (1/W) as output -- 
-matching how call sites immediately store the result as (self.ltqs, ltqsVars) 
-(see Tree.detach_subtree / add_subtree in bonsai_treeHelpers.py). 
-getLtqsAfterChildUpdate, by contrast, takes AND returns precision throughout 
-(it's used to update (xrAsIfRoot_g, WAsIfRoot_g) pairs directly). 
-The tests below check both the variance/precision convention and the numerical 
+Note: subtract_contrib_ltqs and add_contrib_ltqs take the parent's
+*precision* (W) as input but return the parent's *variance* (1/W) as output --
+matching how call sites immediately store the result as (self.ltqs, ltqsVars)
+(see Tree.detach_subtree / add_subtree in bonsai_treeHelpers.py).
+getLtqsAfterChildUpdate, by contrast, takes AND returns precision throughout
+(it's used to update (xrAsIfRoot_g, WAsIfRoot_g) pairs directly).
+The tests below check both the variance/precision convention and the numerical
 identity against findNodeLtqsGivenLeafs computed from scratch.
 """
+
 import numpy as np
 import pytest
 
-from bonsai.bonsai_treeHelpers import (
+from bonsai._core.tree_helpers import (
     add_contrib_ltqs,
     findNodeLtqsGivenLeafs,
     getLtqsAfterChildUpdate,
