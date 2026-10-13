@@ -74,10 +74,19 @@ def reconstruct(
     adata
         Cells x genes; ``adata.uns["bonsai_input"]`` must already be set.
     zscore_cutoff
-        Signal-to-noise cutoff on gene variance. A gene is kept only if the mean over cells of
-        ``mean**2 / var`` exceeds ``zscore_cutoff**2`` (``_core/dataprocessing.py:read_and_filter``,
-        ``zscoreSq = np.sum(means**2 / vars) / nCells``, ``var = max(sd**2, 1e-12)``). A negative
-        value keeps (almost) all genes, since the cutoff is then treated as 0.
+        Signal-to-noise cutoff on gene variance, applied by
+        ``_core/dataprocessing.py:read_and_filter`` (a negative value disables it: the cutoff is
+        then treated as 0, keeping almost all genes). It takes one of three forms depending on
+        ``adata.uns["bonsai_input"]["kind"]``:
+
+        - ``"sanity_posterior"``: a gene is kept if the mean over cells of ``mean**2 / var``
+          exceeds ``zscore_cutoff**2``, with ``var = max(sd**2, 1e-12)``.
+        - ``"likelihood"`` with an SD layer: upstream fits a per-gene variance ``v`` and
+          maximum-likelihood mean ``mu`` first, then keeps the gene if the mean over cells of
+          ``(v / (v + var)) * (mean - mu)**2 / var`` exceeds ``zscore_cutoff**2``; genes whose
+          variance fit does not converge are dropped regardless of the cutoff.
+        - ``"likelihood"`` without an SD layer: there is no z-score filter at all (``zscore_cutoff``
+          is ignored); a gene is dropped only if its per-cell means have zero variance.
     rescale_by_var
         Whether each gene's coordinate is rescaled by its inferred variance before the knn/SPR
         search, i.e. whether a prior is placed that expression changes are more likely in genes
@@ -124,9 +133,10 @@ def reconstruct(
     The modified (or copied) AnnData if ``copy=True``, else ``None``. On success, writes
     ``uns["bonsai"]`` (newick, edges, nodes, loglik, genes_used, config, workdir),
     ``obs["bonsai_node"]`` (vertInd of each cell) and ``var["bonsai_used"]`` (genes kept by
-    upstream's filters: the ``zscore_cutoff`` above and, for ``sanity_posterior`` input, a second
-    per-cell check that ``prior_var - var >= 1e-4`` everywhere, else the gene is dropped;
-    ``_core/dataprocessing.py:read_and_filter``, ``divide_out_prior_cutoff``).
+    upstream's filters, which depend on the input kind as described under ``zscore_cutoff`` above;
+    for ``sanity_posterior`` input specifically there is also a second per-cell check that
+    ``prior_var - var >= 1e-4`` everywhere, else the gene is dropped
+    (``_core/dataprocessing.py:read_and_filter``, ``divide_out_prior_cutoff``)).
 
     Raises
     ------
