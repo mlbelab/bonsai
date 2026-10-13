@@ -74,17 +74,31 @@ def reconstruct(
     adata
         Cells x genes; ``adata.uns["bonsai_input"]`` must already be set.
     zscore_cutoff
-        Genes are used only if their z-scored prior variance exceeds this cutoff.
+        Signal-to-noise cutoff on gene variance. A gene is kept only if the mean over cells of
+        ``mean**2 / var`` exceeds ``zscore_cutoff**2`` (``_core/dataprocessing.py:read_and_filter``,
+        ``zscoreSq = np.sum(means**2 / vars) / nCells``, ``var = max(sd**2, 1e-12)``). A negative
+        value keeps (almost) all genes, since the cutoff is then treated as 0.
     rescale_by_var
-        Rescale each gene by its prior variance before the knn/SPR search.
+        Whether each gene's coordinate is rescaled by its inferred variance before the knn/SPR
+        search, i.e. whether a prior is placed that expression changes are more likely in genes
+        that already vary a lot across the dataset (``_core/config.py``'s ``--rescale_by_var``
+        help text).
     use_knn
-        Number of nearest neighbours used when building the initial tree.
+        Number of nearest neighbours used to find candidate pairs to merge (candidate generation,
+        not tree initialisation). ``-1`` considers all pairs of leaves instead.
     UB_ellipsoid_size
-        Size of the confidence ellipsoid used for the upper bound on branch lengths.
+        Size of the root-position/precision ellipsoid used for a computational upper bound (UB) on
+        how much a candidate merge could increase the log-likelihood, letting Bonsai skip
+        recomputing merges whose UB cannot beat the current best. A value ``< 0`` disables this
+        shortcut entirely. It is a computational optimisation only: it changes neither the
+        candidate pairs considered nor the final result, only how much work is spent choosing
+        between them.
     nnn_n_randommoves
-        Number of random moves tried per nearest-neighbour-interchange (NNI) round.
+        Number of random nearest-neighbour-interchange (NNI) moves performed (per random starting
+        tree) before continuing with greedy NNI.
     nnn_n_randomtrees
-        Number of random starting trees for the NNI search.
+        Number of random starting trees (each built via ``nnn_n_randommoves`` random NNI moves);
+        the one with the highest log-likelihood is kept and refined greedily.
     spr_strategy
         Upstream SPR candidate/target selection strategy (``"large_tree"``, ``"long_branch_sorted"``
         or ``"super_sure"``; see ``_core/dataprocessing.py:do_spr_moveset``).
@@ -109,8 +123,10 @@ def reconstruct(
     -------
     The modified (or copied) AnnData if ``copy=True``, else ``None``. On success, writes
     ``uns["bonsai"]`` (newick, edges, nodes, loglik, genes_used, config, workdir),
-    ``obs["bonsai_node"]`` (vertInd of each cell) and ``var["bonsai_used"]`` (genes that passed
-    ``zscore_cutoff``).
+    ``obs["bonsai_node"]`` (vertInd of each cell) and ``var["bonsai_used"]`` (genes kept by
+    upstream's filters: the ``zscore_cutoff`` above and, for ``sanity_posterior`` input, a second
+    per-cell check that ``prior_var - var >= 1e-4`` everywhere, else the gene is dropped;
+    ``_core/dataprocessing.py:read_and_filter``, ``divide_out_prior_cutoff``).
 
     Raises
     ------

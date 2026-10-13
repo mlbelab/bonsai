@@ -31,18 +31,30 @@
      Narrower handlers (`except ValueError`, `except FileNotFoundError`, `except KeyError`, etc.)
      were also checked; none of their `try` bodies call into converted code. Bare `except:` clauses
      already caught `SystemExit` under upstream too, so they are unchanged.
-4. Unseeded global-NumPy RNG draws: the greedy-merge pair choice
-   (`getOptimalDLogLPairInfoNew`, TH:2403, `np.random.choice(...)`) always uses the global RNG.
-   `Tree.do_spr_moves`'s `select_cand`/`select_target='random'` branches (TH:4403, TH:4451) also
-   draw from the global RNG, but the default pipeline never reaches them: `spr_strategy="large_tree"`
-   (the `tl.reconstruct`/CLI default) calls `do_spr_moveset` with `select_cand='long_branches_first'`,
-   `select_target='cluster_centers'` (`_core/dataprocessing.py:1384-1389`), neither of which is
-   `'random'`. The residual issue is that these unseeded draws start from whatever state the
-   process's global NumPy RNG happens to be in; the explicit NNI seed (`np.random.seed(42)`) is set
-   later and does not cover them. `globals.reset()` deliberately does not reseed between runs, so an
-   in-process repeat (or a second CLI invocation in the same interpreter) may follow a different
-   draw sequence than the first; a single CLI process's single run is unaffected. The golden fixture
-   was reproducible across separate runs; larger inputs may not be.
+4. In the default pipeline, every random draw that affects the reconstructed tree or likelihood is
+   explicitly seeded. `Tree.getOptimalDLogLPairInfoNew`'s `np.random.choice(posDLogLInds, ...)`
+   (`tree_helpers.py:2403`) only executes when its `random` argument is `True`; that argument is
+   `True` only on the call path from `_core/dataprocessing.py:nnnReorderRandom` (defined at
+   `dataprocessing.py:1771`), which calls `Tree.getOptEdgeList(..., random=True, ...)`
+   (`dataprocessing.py:1878`), which forwards `random=True` into
+   `getOptimalDLogLPairInfoNew(..., random=random, ...)` (`tree_helpers.py:1409`). Every call into
+   `nnnReorderRandom` happens after `np.random.seed(42)` (`main.py:390`, and again at
+   `dataprocessing.py:1829` inside `nnnReorderRandom` itself) and a further per-task reseed
+   `np.random.seed(seeds[task])` (`dataprocessing.py:1848`), where `seeds` is itself computed
+   deterministically from that same `seed(42)` state (`dataprocessing.py:1830`,
+   `np.random.choice(int(randomTries * 1e4), size=randomTries, replace=False)`). `Tree.do_spr_moves`'s
+   `select_cand`/`select_target='random'` branches (`tree_helpers.py:4403`, `tree_helpers.py:4451`)
+   also draw from the global RNG unseeded by this mechanism, but the default pipeline never reaches
+   them: `spr_strategy="large_tree"` (the `tl.reconstruct`/CLI default) calls `do_spr_moveset` with
+   `select_cand='long_branches_first'`, `select_target='cluster_centers'`
+   (`dataprocessing.py:1384-1389`), neither of which is `'random'`.
+
+   The only remaining unseeded global-NumPy draws are cosmetic: random suffixes used to build
+   temporary folder/file names that do not feed into any numeric result or decision
+   (`helpers.py:1382`, `helpers.py:1384`, `tree_helpers.py:2011`, `tree_helpers.py:2325`,
+   `tree_helpers.py:2327`). `globals.reset()` deliberately does not reseed between runs, so a
+   second call in the same process could pick different folder-name suffixes than the first, but
+   this does not change the tree, branch lengths or likelihood.
 
 ## Validation deviations (phase 1 packaging)
 5. `bonsai._io_folder.validate_inputs` is stricter than upstream in two ways it does not relax:
