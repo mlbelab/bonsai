@@ -14,9 +14,33 @@ LEGACY_METHOD = "MLE"  # Sanity < 2.0 run with -max_v reports the maximum-likeli
 def read_sanity(path: str | Path) -> AnnData:
     """Read a Sanity output folder (>=2.0 or legacy `_vmax`) into a cells x genes AnnData.
 
-    Sets ``layers["bonsai_mean"]`` (posterior means δ), ``layers["bonsai_sd"]`` (posterior SDs ε),
-    ``var["bonsai_prior_var"]`` (Sanity gene variance), ``var["bonsai_mu"]`` (gene mean) and
-    ``uns["bonsai_input"]``.
+    Sanity must have been run with ``-e 1`` and ``-v_m MAP`` (or ``MLE``/``EAP``); ``-v_m MARG``
+    output is rejected (see the package README for why).
+
+    Parameters
+    ----------
+    path
+        Path to a Sanity output folder. Whether it is >=2.0 or legacy ``_vmax`` output is detected
+        by the presence of ``sanity_command.txt``.
+
+    Returns
+    -------
+    AnnData (cells x genes) with:
+
+    - ``layers["bonsai_mean"]``: Sanity posterior means (delta).
+    - ``layers["bonsai_sd"]``: Sanity posterior SDs (epsilon).
+    - ``var["bonsai_prior_var"]``: Sanity per-gene prior variance.
+    - ``var["bonsai_mu"]``: Sanity per-gene mean.
+    - ``uns["bonsai_input"]``: ``{"kind": "sanity_posterior", "sanity_version": ..., "sanity_method": ...}``.
+
+    ``obs_names``/``var_names`` come from ``cellID.txt``/``geneID.txt`` if present, else upstream's
+    generic fallback names (``Cell_<i>``, ``Gene_<i>``).
+
+    Raises
+    ------
+    ValueError
+        ``sanity_command.txt`` records ``-v_m MARG`` output, or an expected Sanity output file is
+        missing (via ``bonsai._core.helpers.resolve_sanity_filepaths``).
     """
     path = Path(path)
     files = resolve_sanity_filepaths(str(path))  # raises BonsaiError (ValueError) like upstream
@@ -40,7 +64,32 @@ def read_sanity(path: str | Path) -> AnnData:
 
 
 def from_arrays(adata: AnnData, mean_layer: str, sd_layer: str | None = None) -> None:
-    """Mark general (non-Sanity) input: per-cell feature estimates with optional SDs (likelihood)."""
+    """Mark general (non-Sanity) input: per-cell feature estimates with optional SDs (likelihood).
+
+    Use this instead of :func:`read_sanity` when the mean/SD layers were computed some other way.
+    Sets ``adata.uns["bonsai_input"]`` in place; does not otherwise modify ``adata``.
+
+    Parameters
+    ----------
+    adata
+        Cells x genes; must already have ``mean_layer`` (and ``sd_layer``, if given) in
+        ``adata.layers``.
+    mean_layer
+        Name of the layer in ``adata.layers`` holding per-cell, per-gene mean estimates.
+    sd_layer
+        Name of the layer holding the matching standard deviations, or ``None`` (default) for a
+        pure-likelihood model with no per-estimate uncertainty.
+
+    Returns
+    -------
+    None. Sets ``adata.uns["bonsai_input"] = {"kind": "likelihood", "mean_layer": mean_layer,
+    "sd_layer": sd_layer}``.
+
+    Raises
+    ------
+    ValueError
+        ``mean_layer`` or ``sd_layer`` is not a key of ``adata.layers``.
+    """
     for layer in (mean_layer, sd_layer):
         if layer is not None and layer not in adata.layers:
             raise ValueError(f"layer {layer!r} not in adata.layers")

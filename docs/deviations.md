@@ -6,17 +6,18 @@
 2. `_core/tree_helpers.py` TH:1237: `indTask + 1 % 100` parses as `indTask + 1`, so the periodic MPI max exchange
    never fires.
 3. `_core/tree_helpers.py` TH:378, TH:4918; `_core/clustering.py` (raise lines CL:698, CL:857);
-   `_core/config.py` CG:161; `_core/helpers.py` (7 sites: HL:105, HL:1300-1352);
-   `_core/dataprocessing.py` (17 sites); and 3 normal-termination sites in `_core/main.py` (now
-   `return`): library-terminating `exit()`/`sys.exit()` calls; the error-path ones are replaced by
-   `raise BonsaiError(...)` (error path only, same message where one preceded the call). Note: the
-   brief's own locator command (`grep -n "exit()"`) only finds calls with empty parentheses and
-   counts 27; the actual upstream file also has 8 live `exit("message")`/`sys.exit("message")` call
-   sites (dataprocessing.py 7, tree_helpers.py 1) that are semantically identical
-   abnormal-termination calls. All of them (35 total, 3 of which are the normal-termination ones in
-   `main.run`) were converted; none of this touches numerics, decision rules, iteration order or
-   RNG.
-   - **Fix round 1:** two `except Exception` handlers whose `try` body can reach a converted
+   `_core/config.py` CG:161; `_core/helpers.py` (7 sites: HL:105, HL:1300-1352); and
+   `_core/dataprocessing.py` (21 sites): library-terminating `exit()`/`sys.exit()` calls
+   (including `exit("message")`/`sys.exit("message")` call sites, which are semantically
+   identical abnormal-termination calls) replaced by `raise BonsaiError(...)` (error path only,
+   same message where one preceded the call) — 33 sites total
+   (`grep -rc "raise BonsaiError" src/bonsai/_core/*.py`: dataprocessing.py 21, helpers.py 7,
+   tree_helpers.py 2, clustering.py 2, config.py 1). Three further normal-termination `exit()`
+   sites in `_core/main.py` (`main.py:114`, `main.py:417`, `main.py:539`) are now plain `return`.
+   None of this touches numerics, decision rules, iteration order or RNG. Packaging consequence:
+   the CLI (`bonsai run`) does not catch `BonsaiError`, so an error now exits with code 1 and a
+   Python traceback, where upstream's bare `exit()` (a `SystemExit()` with no argument) exited 0.
+   - Two `except Exception` handlers whose `try` body can reach a converted
      `raise BonsaiError(...)` used to let upstream's `exit()` (`SystemExit`, a `BaseException`)
      propagate unimpeded, but would now silently swallow the `BonsaiError` (a `ValueError`,
      `Exception` subclass) instead, changing abort-vs-continue behaviour. Fixed by adding
@@ -30,9 +31,32 @@
      Narrower handlers (`except ValueError`, `except FileNotFoundError`, `except KeyError`, etc.)
      were also checked; none of their `try` bodies call into converted code. Bare `except:` clauses
      already caught `SystemExit` under upstream too, so they are unchanged.
-4. SPR random choices (TH:2403, 4403, 4451) use the unseeded global NumPy RNG (the NNI seed
-   `np.random.seed(42)` is set later). The golden fixture was reproducible across runs, but larger
-   inputs may not be deterministic.
+4. Unseeded global-NumPy RNG draws: the greedy-merge pair choice
+   (`getOptimalDLogLPairInfoNew`, TH:2403, `np.random.choice(...)`) always uses the global RNG.
+   `Tree.do_spr_moves`'s `select_cand`/`select_target='random'` branches (TH:4403, TH:4451) also
+   draw from the global RNG, but the default pipeline never reaches them: `spr_strategy="large_tree"`
+   (the `tl.reconstruct`/CLI default) calls `do_spr_moveset` with `select_cand='long_branches_first'`,
+   `select_target='cluster_centers'` (`_core/dataprocessing.py:1384-1389`), neither of which is
+   `'random'`. The residual issue is that these unseeded draws start from whatever state the
+   process's global NumPy RNG happens to be in; the explicit NNI seed (`np.random.seed(42)`) is set
+   later and does not cover them. `globals.reset()` deliberately does not reseed between runs, so an
+   in-process repeat (or a second CLI invocation in the same interpreter) may follow a different
+   draw sequence than the first; a single CLI process's single run is unaffected. The golden fixture
+   was reproducible across separate runs; larger inputs may not be.
+
+## Validation deviations (phase 1 packaging)
+5. `bonsai._io_folder.validate_inputs` is stricter than upstream in two ways it does not relax:
+   non-finite mean/SD/prior-variance/mu is always refused (upstream would propagate NaN/Inf
+   silently into the likelihood), and a negative SD is refused (upstream's own derivation assumes
+   `sd >= 0`). It is not stricter anywhere else: `sd == 0` and non-positive
+   `var["bonsai_prior_var"]` are accepted and passed through unchanged, matching upstream's own
+   handling (it clamps `var = max(sd**2, 1e-12)` and drops genes where
+   `prior_var - var < 1e-4`, rather than rejecting them up front).
+6. `bonsai.tl._check_names` checks gene names only for uniqueness and the absence of a tab or
+   newline (which would corrupt the per-gene TSV columns they index); gene names are never used as
+   newick labels, so they do not need the full cell-name check. Cell names keep the full check:
+   uniqueness, no whitespace or `(),:;` (newick syntax characters), and no collision with upstream's
+   internal vertex names (`root`, `internal_<n>`).
 
 ## Packaging changes
 - Config paths are relative to the current directory (upstream chdir'd to the repo root); this also applies to
@@ -44,10 +68,7 @@
   `log_level = logging.WARNING` is immediately overwritten by `log_level = logging.DEBUG` in both files, so the
   "myapp" logger's effective level was always DEBUG (10), not WARNING, regardless of the root `basicConfig`
   level. `bonsai.cli.main` reproduces this by setting `logging.getLogger("myapp").setLevel(logging.DEBUG)`
-  explicitly (**fix round 1**: was mistakenly `logging.INFO` and the task-2 report wrongly claimed importing
-  `_core.helpers` afterwards would reset it to DEBUG anyway and self-correct the visible level; measurement
-  showed the effective level stayed at INFO (20), hiding `mp_print(..., DEBUG=True)`/`logger.debug` output
-  that upstream always showed).
+  explicitly.
 - Matplotlib is now imported lazily in `_core/helpers.py` (`_plotting_setup()`, `_plot_colors()`), used only by
   plotting functions (`get_celltype_colors`, `pause_anim`, `_core/dataprocessing.py`'s `set_node_edge_style`);
   `import bonsai` no longer loads matplotlib.
@@ -55,3 +76,7 @@
   `reconstruct(..., keep_workdir=True)` work directory, instead of recomputing the posterior from the
   stored tree. Recomputation is cheap and is left to a later (phase 2) milestone; for now the function
   raises `ValueError` if the AnnData does not carry a kept workdir (`uns["bonsai"]["workdir"]` falsy).
+- `tl.reconstruct`'s `verbose` defaults to `False`; the upstream config template defaults it to `True`.
+  `verbose` only gates extra `mp_print`/logger output inside `_core` (e.g. `main.py:148`, `main.py:157`,
+  `storeTreeInFolder(..., verbose=args.verbose)` calls); it does not change any numeric result, decision
+  rule or iteration order.
