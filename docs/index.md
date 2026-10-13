@@ -10,4 +10,7 @@ api.md
 changelog.md
 contributing.md
 references.md
+testing.md
+provenance.md
+deviations.md
 ```

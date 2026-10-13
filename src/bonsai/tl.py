@@ -4,8 +4,10 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import numpy as np
+import pandas as pd
 from anndata import AnnData
 from ruamel.yaml import YAML
 
@@ -63,6 +65,7 @@ def reconstruct(
         wd = Path(tempfile.mkdtemp(prefix="bonsai_"))
         existed = False  # ours: mkdtemp already created it, but it is fully disposable
     else:
+        assert workdir is not None, "tmp is False only when workdir was given"
         wd = Path(workdir)
         existed = wd.exists()
         if existed and any(wd.iterdir()):
@@ -112,10 +115,11 @@ def node_posteriors(adata: AnnData) -> AnnData:
         raise ValueError("node posteriors need the work directory: run reconstruct(..., keep_workdir=True)")
     final = io._final_folder(Path(wd) / "results")
     nodes = adata.uns["bonsai"]["nodes"]
+    var = cast(pd.DataFrame, adata.var)  # in-memory AnnData: var is always a DataFrame, never Dataset2D
     out = AnnData(
         X=np.load(final / "posterior_ltqs_vertByGene.npy"),
         obs=nodes.set_index(nodes["name"].astype(str)),
-        var=adata.var.loc[adata.var["bonsai_used"].to_numpy(), []],
+        var=var.loc[var["bonsai_used"].to_numpy(), []],
     )
     out.layers["var"] = np.load(final / "posterior_ltqsVars_vertByGene.npy")
     return out

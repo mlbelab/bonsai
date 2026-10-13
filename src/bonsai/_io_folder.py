@@ -55,6 +55,7 @@ def write_data_folder(adata: AnnData, folder: Path) -> dict:
     write_ids(str(folder / "geneID.txt"), list(adata.var_names))
     info = adata.uns["bonsai_input"]
     if info["kind"] == "sanity_posterior":
+        assert sd is not None, "validate_inputs always returns an SD array for sanity_posterior input"
         np.savetxt(folder / "delta.txt", mean.T, fmt=FMT, delimiter="\t")
         np.savetxt(folder / "d_delta.txt", sd.T, fmt=FMT, delimiter="\t")
         np.savetxt(folder / "variance.txt", adata.var["bonsai_prior_var"].to_numpy(), fmt=FMT)

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import SupportsFloat, cast
 
 import pandas as pd
 from anndata import AnnData
@@ -29,7 +30,8 @@ def read_results(folder: str | Path, adata: AnnData | None = None) -> AnnData:
     meta = json.loads((final / "metadata.json").read_text())
     nodes = pd.read_csv(final / "vertInfo.txt", sep="\t")[["vertInd", "vertName"]].rename(columns={"vertName": "name"})
     edges = pd.read_csv(final / "edgeInfo.txt", sep="\t", header=None, names=["parent", "child", "t"])
-    loglik = float(pd.read_csv(final / "metadata_bonsai.txt", index_col=0).loc["metadata", "finalLoglik"])
+    raw_loglik = pd.read_csv(final / "metadata_bonsai.txt", index_col=0).loc["metadata", "finalLoglik"]
+    loglik = float(cast(SupportsFloat, raw_loglik))
     if adata is None:
         adata = AnnData(obs=pd.DataFrame(index=meta["cellIds"]), var=pd.DataFrame(index=meta["geneIds"]))
     vert = nodes.set_index("name")["vertInd"]

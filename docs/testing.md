@@ -26,8 +26,30 @@ uv run pytest tests/test_pairwise_merge_dlogl.py::test_dlogl_prefers_similar_pai
 | `test_branch_length_init.py` | `calcTInit` | Initial branch-length guesses fed to the optimisers above. |
 | `test_nn_recall.py` | `getFracCorrectNNs` | NN-search accuracy metric used in `_core/approx_nn.py`'s standalone benchmarking script. |
 
-201 tests total (`uv run pytest --collect-only -q`). The golden regression fixture
-(`tests/data/golden_b16ef6f`) is staged for packaging; its test arrives in a later task.
+257 tests total (`uv run pytest --collect-only -q`).
+
+## Golden regression tests
+
+Three files compare a run against the frozen upstream reference `tests/data/golden_b16ef6f`
+(provenance in `docs/provenance.md`), each marked `slow` (run with `uv run pytest`, skipped by
+`uv run pytest -m "not slow"`; they take minutes on this node):
+
+| Test file | Entry point exercised | What it checks |
+|---|---|---|
+| `test_golden_core.py` | `bonsai._core.main.run_from_config` | The upstream config/run path directly: the result matches golden (`test_core_matches_golden`), and two in-process runs on the same config are bitwise-identical newicks (`test_second_in_process_run_is_identical`). |
+| `test_tl.py` | `bonsai.pp.read_sanity` + `bonsai.tl.reconstruct` | The public API path end-to-end against golden, plus that `adata.uns["bonsai"]` carries exactly what upstream wrote (loglik, newick) and that the AnnData slots (`obs`/`var`/`uns`) are populated as documented. |
+| `test_cli.py` | `bonsai.cli` (`bonsai run`) | The CLI subprocess path against golden; also (non-slow) that `bonsai config` writes a YAML and that an unrecognized CLI option is rejected rather than silently dropped. |
+
+`tests/golden.py` holds the comparison logic (`assert_trees_match`): topology (the set of rooted
+clades) must match exactly. For the loglik and branch lengths, if `tree.nwk` is byte-identical and
+the recorded `finalLoglik` matches exactly, that's asserted directly (expected on the reference
+platform used to record the fixture). Otherwise it falls back to a derived tolerance: the final
+stage (`Tree.optTimes`, `tree_helpers.py`) is `scipy.optimize.minimize` with L-BFGS-B at
+`ftol=1e-6`, i.e. it stops once the relative decrease in `-loglik` per step is `<= ftol`; two
+platforms (different BLAS/libm) can therefore stop a few such steps apart, giving `loglik` a
+`rtol` of `10 * ftol`. Near a smooth optimum `df ~ (1/2) H dt^2`, so branch lengths are fixed only
+to `~sqrt(ftol)` relative, giving branch-length `rtol = 10 * sqrt(ftol)`. Both tolerances use
+`atol=0` (pure `rtol`, derived from the optimizer's own stopping rule, not tuned to pass).
 
 ## Call graph of the tested core
 
@@ -36,7 +58,7 @@ functions (solid arrows = direct calls; the `Tree`/`TreeNode` methods at the
 top are the *only* stateful, untested entry points — everything below them
 is pure and covered).
 
-```mermaid
+```
 flowchart TD
     subgraph stateful["Tree / TreeNode methods (stateful, NOT covered)"]
         getNewPairs["Tree.getNewPairs<br/>Tree.mergeChildrenUB"]
@@ -88,7 +110,7 @@ single call for `scipy.optimize.minimize`.
 
 Separate from the tree-merge path, and independent of it:
 
-```mermaid
+```
 flowchart LR
     read_and_filter --> neg_loglik_grad_using_measurements_and_errors
     reorderChildrenRoot --> get_pdist_inds
