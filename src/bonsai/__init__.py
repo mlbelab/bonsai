@@ -1,5 +1,5 @@
 from importlib.metadata import version
 
-from . import pp
+from . import io, pp, tl
 
 __version__ = version("bonsai")

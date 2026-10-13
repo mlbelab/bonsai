@@ -51,3 +51,7 @@
 - Matplotlib is now imported lazily in `_core/helpers.py` (`_plotting_setup()`, `_plot_colors()`), used only by
   plotting functions (`get_celltype_colors`, `pause_anim`, `_core/dataprocessing.py`'s `set_node_edge_style`);
   `import bonsai` no longer loads matplotlib.
+- `tl.node_posteriors` reads the posterior `.npy` files that upstream already wrote to the kept
+  `reconstruct(..., keep_workdir=True)` work directory, instead of recomputing the posterior from the
+  stored tree. Recomputation is cheap and is left to a later (phase 2) milestone; for now the function
+  raises `ValueError` if the AnnData does not carry a kept workdir (`uns["bonsai"]["workdir"]` falsy).
