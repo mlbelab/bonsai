@@ -227,6 +227,76 @@ def test_reconstruct_removes_temp_workdir_on_failure(monkeypatch):
     assert "bonsai" not in a.uns
 
 
+def test_reconstruct_failed_copy_creates_no_temp_dir(monkeypatch):
+    """A copy() that raises (e.g. a backed AnnData) must not leave a bonsai_* temp dir behind: the
+    copy happens before tempfile.mkdtemp is ever called (item 3)."""
+    import tempfile
+
+    a = bonsai.pp.read_sanity(FIXTURE)
+    calls = []
+
+    def recording_mkdtemp(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("mkdtemp must not be called when the copy fails")
+
+    def failing_copy(self):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(bonsai.tl.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(anndata.AnnData, "copy", failing_copy)
+    before = set(Path(tempfile.gettempdir()).glob("bonsai_*"))
+    with pytest.raises(RuntimeError, match="copy failed"):
+        bonsai.tl.reconstruct(a, copy=True)
+    assert calls == []
+    assert set(Path(tempfile.gettempdir()).glob("bonsai_*")) == before
+
+
+def test_reconstruct_relative_workdir_resolved_and_usable_after_chdir(monkeypatch, tmp_path):
+    """A relative workdir must be stored resolved to an absolute path, so node_posteriors still
+    finds it after the caller changes directory (item 6)."""
+    monkeypatch.chdir(tmp_path)
+    a = bonsai.pp.read_sanity(FIXTURE)
+    monkeypatch.setattr(bonsai.tl, "run_from_config", _fake_run)
+    bonsai.tl.reconstruct(a, workdir="wd", keep_workdir=True)
+    stored = a.uns["bonsai"]["workdir"]
+    assert Path(stored).is_absolute()
+    assert Path(stored) == (tmp_path / "wd").resolve()
+
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    n = bonsai.tl.node_posteriors(a)
+    assert n.shape == (len(a.uns["bonsai"]["nodes"]), len(a.uns["bonsai"]["genes_used"]))
+
+
+def test_node_posteriors_robust_to_vertinfo_row_order(tmp_path):
+    """vertInfo.txt row order is not guaranteed to be vertInd order; node_posteriors must align
+    obs to the .npy files' vertInd-ordered rows regardless (item 7: sort_values('vertInd')),
+    checked against an independently parsed, vertInd-sorted copy of the original file."""
+    import shutil
+
+    final = tmp_path / "results" / "final_bonsai_shuffled"
+    shutil.copytree(GOLDEN, final)
+    lines = (final / "vertInfo.txt").read_text().splitlines()
+    header, rows = lines[0], lines[1:]
+    rng = np.random.default_rng(0)
+    perm = rng.permutation(len(rows))
+    shuffled_rows = [rows[i] for i in perm]
+    assert shuffled_rows != rows  # the permutation actually reorders something
+    (final / "vertInfo.txt").write_text("\n".join([header, *shuffled_rows]) + "\n")
+
+    a = bonsai.io.read_results(final)
+    a.uns["bonsai"]["workdir"] = str(tmp_path)
+    n = bonsai.tl.node_posteriors(a)
+
+    meta = json.loads((GOLDEN / "metadata.json").read_text())
+    vert_by_ind = sorted((int(r.split("\t")[0]), r.split("\t")[2]) for r in rows)  # from the *original* order
+    assert list(n.obs_names) == [name for _, name in vert_by_ind]
+    assert list(n.var_names) == list(meta["geneIds"])
+    np.testing.assert_array_equal(n.X, np.load(GOLDEN / "posterior_ltqs_vertByGene.npy"))
+    np.testing.assert_array_equal(n.layers["var"], np.load(GOLDEN / "posterior_ltqsVars_vertByGene.npy"))
+
+
 def test_too_few_cells_rejected(tmp_path):
     a = bonsai.pp.read_sanity(FIXTURE)[:2].copy()
     with pytest.raises(ValueError, match="at least 3 cells"):
