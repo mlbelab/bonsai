@@ -26,6 +26,8 @@ If you use this package, please cite the *Bonsai* paper and the software, see
 ## Getting started
 
 Please refer to the [documentation][link-docs], in particular the [API documentation][link-api].
+For a worked tour of the package on example datasets, see
+[`docs/notebooks/bonsai_tour.ipynb`][link-tour].
 
 ## Installation
 
@@ -164,6 +166,7 @@ See [`CITATION.cff`](https://github.com/mlbelab/bonsai/blob/main/CITATION.cff).
 [changelog]: https://github.com/mlbelab/bonsai/blob/main/docs/changelog.md
 [link-docs]: https://github.com/mlbelab/bonsai/tree/main/docs
 [link-api]: https://github.com/mlbelab/bonsai/blob/main/docs/api.md
+[link-tour]: https://github.com/mlbelab/bonsai/blob/main/docs/notebooks/bonsai_tour.ipynb
 [upstream]: https://github.com/dhdegroot/Bonsai-data-representation
 [upstream-scout]: https://github.com/dhdegroot/Bonsai-data-representation#bonsai-scout-visualizing-the-bonsai-results
 [deviations]: https://github.com/mlbelab/bonsai/blob/main/docs/deviations.md
