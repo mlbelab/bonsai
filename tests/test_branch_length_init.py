@@ -18,9 +18,10 @@ These are only optimiser starting points, not exact answers, so the tests
 check structural invariants (shape, non-negativity, internal consistency)
 rather than a single "correct" numeric output.
 """
+
 import pytest
 
-from bonsai.bonsai_helpers import calcTInit
+from bonsai._core.helpers import calcTInit
 
 
 @pytest.mark.parametrize("tOld1,tOld2", [(3.0, 5.0), (5.0, 3.0), (1.0, 1.0), (0.0, 0.0), (0.0, 2.0)])

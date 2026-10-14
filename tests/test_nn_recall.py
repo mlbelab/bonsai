@@ -7,10 +7,11 @@ from the `if __name__ == '__main__'` benchmarking block at the bottom of
 bonsai_approxNN.py (used to compare candidate NN backends), not from the main
 tree-building pipeline.
 """
+
 import numpy as np
 import pytest
 
-from bonsai.bonsai_approxNN import getFracCorrectNNs
+from bonsai._core.approx_nn import getFracCorrectNNs
 
 
 def random_neighbour_matrix(rng, n_cells, k, pool_size):

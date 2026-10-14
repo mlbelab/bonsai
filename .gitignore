@@ -1,5 +1,30 @@
-# Byte-compiled / optimized / DLL files
+# Temp files
+.DS_Store
+*~
+buck-out/
+
+# IDEs
+/.idea/
+/.vscode/
+
+# Compiled files
+.venv/
 __pycache__/
+.*cache/
+
+# Distribution / packaging
+/dist/
+
+# Tests and coverage
+/data/
+/node_modules/
+/.coverage*
+
+# docs
+/docs/generated/
+/docs/_build/
+
+# Byte-compiled / optimized / DLL files
 *.py[cod]
 *$py.class
 
@@ -10,7 +35,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -68,9 +92,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 target/
 
@@ -99,7 +120,6 @@ celerybeat-schedule
 
 # Environments
 .env
-.venv
 env/
 venv/
 ENV/
@@ -123,7 +143,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-.DS_Store
 *.bcf
 *.aux
 *.out
@@ -131,20 +150,26 @@ dmypy.json
 *.gz
 *.toc
 
-# Added by Daan
+# Added by Daan (upstream)
 data/*
 results/*
 examples/1_simple_example/results/*
-
 .idea/Bonsai-data-representation.iml
 .idea/Private-bonsai.iml
 .idea/.gitignore
 *.png
 *.svg
 *.npy
+!tests/data/golden_b16ef6f/*.npy
 useful_scripts_not_bonsai/simulating_datasets/analyzing_simulated_datasets/results/
 slurm_runs_pipeline/
-.idea/Private-bonsai.iml
 local_scripts/*
 *.prof
-/.vscode
+
+# workspace/agent files live outside the repo
+.claude/
+CLAUDE.md
+AGENTS.md
+.omc/
+.sdd/
+._*

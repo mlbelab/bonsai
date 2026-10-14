@@ -8,13 +8,14 @@ Given children with positions ltqs_gi, measurement variances ltqsVars_gi and
 connecting branch lengths t_i, each child contributes a Gaussian message with
 precision wbar = 1 / (var + t). The parent's position is the precision-weighted
 average of its children and its precision is the sum of the children's
-precisions. This is the core step used everywhere a node's position is 
+precisions. This is the core step used everywhere a node's position is
 (re)computed from its neighbours.
 """
+
 import numpy as np
 import pytest
 
-from bonsai.bonsai_treeHelpers import findNodeLtqsGivenLeafs, findNodeLtqsGivenLeafsSingleGene
+from bonsai._core.tree_helpers import findNodeLtqsGivenLeafs, findNodeLtqsGivenLeafsSingleGene
 
 
 def test_two_children_match_manual_weighted_average():
@@ -37,8 +38,7 @@ def test_precision_is_sum_of_child_precisions():
     ltqsVars_gi = rng.uniform(0.1, 2.0, (n_genes, n_children))
     t_i = rng.uniform(0.0, 1.0, n_children)
 
-    xr_g, W_g, wbar_gi = findNodeLtqsGivenLeafs(ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i,
-                                                 return_wbar_gi=True)
+    xr_g, W_g, wbar_gi = findNodeLtqsGivenLeafs(ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i, return_wbar_gi=True)
 
     assert wbar_gi == pytest.approx(1 / (ltqsVars_gi + t_i))
     assert W_g == pytest.approx(np.sum(wbar_gi, axis=1))
@@ -67,14 +67,20 @@ def test_single_gene_matches_vectorised_slice(seed):
     t_i = rng.uniform(0.0, 1.0, n_children)
 
     xr_g, W_g, wbar_gi, wOverW_gi = findNodeLtqsGivenLeafs(
-        ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i,
-        return_wbar_gi=True, return_wOverW_gi=True,
+        ltqs_gi=ltqs_gi,
+        ltqsVars_gi=ltqsVars_gi,
+        t_i=t_i,
+        return_wbar_gi=True,
+        return_wOverW_gi=True,
     )
 
     for gene_ind in range(n_genes):
         xr, W, wbar_i, wOverW_i = findNodeLtqsGivenLeafsSingleGene(
-            ltqs_gi[gene_ind], ltqsVars_gi[gene_ind], t_i,
-            return_wbar_i=True, return_wOverW_i=True,
+            ltqs_gi[gene_ind],
+            ltqsVars_gi[gene_ind],
+            t_i,
+            return_wbar_i=True,
+            return_wOverW_i=True,
         )
         assert xr == pytest.approx(xr_g[gene_ind])
         assert W == pytest.approx(W_g[gene_ind])
@@ -93,8 +99,9 @@ def test_return_flags_control_output_arity():
     with_wbar = findNodeLtqsGivenLeafs(ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i, return_wbar_gi=True)
     assert len(with_wbar) == 3
 
-    with_both = findNodeLtqsGivenLeafs(ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i,
-                                        return_wbar_gi=True, return_wOverW_gi=True)
+    with_both = findNodeLtqsGivenLeafs(
+        ltqs_gi=ltqs_gi, ltqsVars_gi=ltqsVars_gi, t_i=t_i, return_wbar_gi=True, return_wOverW_gi=True
+    )
     assert len(with_both) == 4
     # The leading values must agree regardless of how much extra info is requested.
     assert with_both[0] == pytest.approx(xr_only[0])

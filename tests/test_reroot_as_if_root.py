@@ -17,10 +17,11 @@ from the root to get the combined information from "everything else", (2) send
 that info back across tConn to the node's location and combine it with the
 node's own (already-local) info.
 """
+
 import numpy as np
 import pytest
 
-from bonsai.bonsai_treeHelpers import getLtqsAsIfRoot, getLtqsAsIfRoot_vectorized
+from bonsai._core.tree_helpers import getLtqsAsIfRoot, getLtqsAsIfRoot_vectorized
 
 
 def build_two_child_star(rng, n_genes=5):
@@ -40,9 +41,16 @@ def build_two_child_star(rng, n_genes=5):
     root_W = wbar_node + wbar_rest
     root_ltqs = (wbar_node * node_ltqs + wbar_rest * rest_ltqs) / root_W
 
-    return dict(node_ltqs=node_ltqs, node_W=node_W, tConn=tConn,
-                rest_ltqs=rest_ltqs, rest_var=rest_var, tConn2=tConn2,
-                root_ltqs=root_ltqs, root_W=root_W)
+    return {
+        "node_ltqs": node_ltqs,
+        "node_W": node_W,
+        "tConn": tConn,
+        "rest_ltqs": rest_ltqs,
+        "rest_var": rest_var,
+        "tConn2": tConn2,
+        "root_ltqs": root_ltqs,
+        "root_W": root_W,
+    }
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -99,7 +107,8 @@ def test_vectorised_matches_scalar_per_column(seed):
     ltqs_vec, W_vec = getLtqsAsIfRoot_vectorized(node_ltqs_gi, node_W_gi, tConn_i, s["root_ltqs"], s["root_W"])
 
     for i in range(n_i):
-        ltqs_scalar, W_scalar = getLtqsAsIfRoot(node_ltqs_gi[:, i], node_W_gi[:, i], tConn_i[i],
-                                                 s["root_ltqs"], s["root_W"])
+        ltqs_scalar, W_scalar = getLtqsAsIfRoot(
+            node_ltqs_gi[:, i], node_W_gi[:, i], tConn_i[i], s["root_ltqs"], s["root_W"]
+        )
         assert ltqs_vec[:, i] == pytest.approx(ltqs_scalar)
         assert W_vec[:, i] == pytest.approx(W_scalar)

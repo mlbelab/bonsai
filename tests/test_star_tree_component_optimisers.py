@@ -20,11 +20,12 @@ computed reference.
         test_pairwise_merge_dlogl.py) the sequential path is a lower bound on
         the direct one, not an equivalent alternative.
 """
+
 import numpy as np
 import pytest
 
-import bonsai.bonsai_globals as bs_glob
-from bonsai.bonsai_treeHelpers import (
+import bonsai._core.globals as bs_glob
+from bonsai._core.tree_helpers import (
     derLogLikStar,
     findOptimalTSingleCell,
     getOptTime2LeafTree,
@@ -111,8 +112,9 @@ def test_sequential_t12_matches_two_leaf_optimiser(seed):
     ltqsVars_gi = rng.uniform(0.2, 1.5, (n_genes, 3))
 
     _, _, t12Opt, success = optimiseT3LeafStarSequential(ltqs_gi, ltqsVars_gi, np.array([0.5, 0.5]), tol=1e-8)
-    expected_t12, expected_converged = getOptTime2LeafTree(ltqs_gi[:, 0], ltqsVars_gi[:, 0],
-                                                             ltqs_gi[:, 1], ltqsVars_gi[:, 1], tol=1e-8)
+    expected_t12, expected_converged = getOptTime2LeafTree(
+        ltqs_gi[:, 0], ltqsVars_gi[:, 0], ltqs_gi[:, 1], ltqsVars_gi[:, 1], tol=1e-8
+    )
 
     assert success and expected_converged
     assert t12Opt == pytest.approx(expected_t12)

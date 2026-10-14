@@ -9,14 +9,15 @@ NOTE: there is no check that i != j. Calling get_pdist_inds(shape, i, i)
 does not raise -- it silently falls through to the "i >= j" branch and
 returns a plausible-looking index that collides with some *other*, unrelated
 valid pair's index (e.g. get_pdist_inds(5, 2, 2) == get_pdist_inds(5, 1, 4)
-== 6). Current call sites happen to never pass i == j, but we test with 
+== 6). Current call sites happen to never pass i == j, but we test with
 test_diagonal_call_silently_collides_with_an_unrelated_pair.
 """
+
 import numpy as np
 import pytest
 from scipy.spatial import distance
 
-from bonsai.bonsai_helpers import get_pdist_inds
+from bonsai._core.helpers import get_pdist_inds
 
 
 @pytest.mark.parametrize("n", [3, 4, 5, 8, 12])

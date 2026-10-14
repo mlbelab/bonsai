@@ -11,10 +11,11 @@ For two leaves with per-gene measurements (ltqs) and measurement variances
 Gaussian: totalVar_g = ltqsVars1_g + ltqsVars2_g + t12, and the log-likelihood
 (up to an additive constant) is -sum(log(totalVar_g) + sqDist_g / totalVar_g).
 """
+
 import numpy as np
 import pytest
 
-from bonsai.bonsai_treeHelpers import der2LeafTree, getLoglik2LeafTree, getOptTime2LeafTree
+from bonsai._core.tree_helpers import der2LeafTree, getLoglik2LeafTree, getOptTime2LeafTree
 
 
 def test_identical_leaves_give_zero_optimal_time():
