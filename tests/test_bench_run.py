@@ -5,6 +5,7 @@ import subprocess
 import numpy as np
 import pytest
 from bench import run
+from bench.metrics import quartet_accuracy, rf_distance
 from bench.simulators.brownian import simulate
 
 from bonsai._ref.newick import children_lists, parse_newick
@@ -210,11 +211,21 @@ def test_smoke_run_end_to_end(tmp_path):
     (r,) = res["runs"]
     assert r["kind"] == "cold" and r["wall_s"] > 0 and "SPR moves" in [name for name, _ in r["stages_s"]]
     # (item 1) the full-precision upstream tree is stored, re-scorable without rerunning the baseline.
-    # Upstream's tree may have polytomies, so only the root count and leaf count are checked.
-    parent, _, _ = parse_newick(r["newick"])
+    # Upstream's tree may have polytomies, so only the root count and leaf count are checked structurally.
+    parent, _, names = parse_newick(r["newick"])
     kids = children_lists(parent)
     assert int((parent < 0).sum()) == 1
-    assert sum(1 for k in kids if not k) == 24
+    leaves = {names[i] for i in range(len(parent)) if not kids[i]}
+    assert len(leaves) == 24
+    # The real point of storing the newick: re-scoring it from scratch against the true tree (the
+    # same config/seed the smoke config uses) reproduces the quartet/RF numbers written by main(),
+    # without rerunning upstream.
+    sim = simulate(n_cells=24, n_genes=60, seed=0)
+    assert leaves == set(sim.adata.obs_names)
+    truth, scored = (sim.parent, sim.names), (parent, names)
+    acc, n_q = quartet_accuracy(truth, scored, seed=0)
+    assert acc == r["truth"]["quartet_accuracy"] and n_q == r["truth"]["n_quartets"]
+    assert rf_distance(truth, scored) == r["truth"]["rf_normalised"]
     assert json.loads((out / "run0_partial.json").read_text())["stages_s"] == r["stages_s"]
     assert "took" in (out / "run0_upstream.log").read_text()
     ll = r["loglik"]

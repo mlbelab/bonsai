@@ -33,9 +33,11 @@ def _upward(parent, t, x, var):
 
     ponytail: allocates and copies full (2N-1, G) arrays even though only internal rows are
     written; `tests/_bounds.py:loglik_scale` indexes the returned X/W by both leaf and internal
-    node id, so shrinking this to internal-only storage means changing that contract too.
-    Upgrade path (M4): a node-message type (leaf view + internal array) once that caller is
-    revisited for scale.
+    node id, so shrinking this to internal-only storage means changing that contract too. At
+    100k cells and ~2k genes used (the M0 target, A-3), the caller's own node-indexed x/var plus
+    this function's X/V copies are four float64 (2N-1, G) ~= (2e5, 2e3) arrays at ~3.2 GB each,
+    about 13 GB total. Upgrade path (M4): a node-message type (leaf view + internal array) once
+    that caller is revisited for scale.
     """
     order, kids = postorder(parent)
     t = np.asarray(t, dtype=np.float64)

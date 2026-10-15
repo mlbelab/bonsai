@@ -25,6 +25,17 @@
 
 set -euo pipefail
 
+# SLURM runs the job in the directory it was submitted from (no --chdir here, since the dedicated
+# worktree's path is chosen at `git worktree add` time, not known in advance): guard against running
+# in the wrong tree (e.g. the main checkout, or a stale worktree) by requiring this very script to be
+# present relative to the current directory and that directory to be a git working tree.
+if [[ ! -f bench/slurm/baselines.sbatch ]] || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: not running from the dedicated baseline worktree's repo root" \
+       "(bench/slurm/baselines.sbatch not found under \$(pwd), or \$(pwd) is not a git checkout)." \
+       "Submit from the worktree created per this script's header comment." >&2
+  exit 1
+fi
+
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 JAX_PLATFORMS=cpu
 
 out="${BENCH_OUT:-bench/results}"
