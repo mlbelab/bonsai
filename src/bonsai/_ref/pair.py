@@ -1,7 +1,9 @@
 """fp64 NumPy reference: 2-leaf time, 3-leaf pair score (sequential/joint, A2), upper-bound slopes.
 
 Maths ref §5-§7. G-vectors are 1-D arrays; times and log-likelihoods in 2x units (A1). The
-optimisers here are tight (they define the optimum), not upstream's loose scoring tolerances.
+optimisers here are tight: they compute the exact optimum of upstream's objective (to fp64
+resolution), and upstream's solves (tol 1e-4 when scoring, 1e-9 for merges) sit within their own
+stopping gap of it.
 """
 
 from typing import NamedTuple
@@ -9,9 +11,16 @@ from typing import NamedTuple
 import numpy as np
 from scipy.optimize import brentq, minimize
 
-from .star import star_loglik_grad, two_leaf_dlogl  # two_leaf_dlogl re-exported
+from .star import node_message, star_loglik_grad, two_leaf_dlogl  # two_leaf_dlogl re-exported
 
 LOG_T_MIN, LOG_T_MAX = -16.1180, 10.0  # TH:4826, 4864 (t in [1.0e-7, 2.2e4])
+EPS64 = float(np.finfo(np.float64).eps)
+# Reference stopping rule: every free coordinate has |g_i| <= (KKT_EPS_FACTOR + G)·eps64·Σ_g|terms of g_i|
+# (``_scales``), i.e. its gradient is zero to what fp64 resolves: <= 8 rounded ops per gene term, +1 for
+# the chain rule (g_1 − g_2 or t·g), <= G − 1 for the gene sum, and <= 6 for t = fl(exp(u)) and
+# t_2a = fl(t12 − t_1a) (a relative eps change of a time moves each term, a product of <= 3 weights with
+# |dlog w/dlog t| <= 1, by <= 3·eps·|term|). G + 14 <= G + 16.
+KKT_EPS_FACTOR = 16
 
 
 def two_leaf_time(x1, v1, x2, v2) -> tuple[float | None, bool]:
@@ -56,26 +65,50 @@ def _neg_ell(times, xs, vs):
     return -ell, -grad
 
 
-def seq_objective(u, t12, xs, vs):
-    """(−ell, gradient) of the 3-star in u = (t_1a, log t_aR), t_2a = t12 − t_1a (TH:5219-5226)."""
+def _scales(tt, xs, vs):
+    """(Σ|terms| of ell, Σ_g|terms| of dell/dt_c per time): fp64 rounding scales (TH:5093-5114).
+
+    The scales of ``star_loglik_grad``'s terms. r = x_n − x_c is formed from numbers of size |x|, so its
+    rounding moves w·r² by up to 2·w·r·eps·(|x_n| + |x_c|): budgeted as a cross term.
+    """
+    w = 1.0 / (vs + tt[:, None])
+    xn, Wn = node_message(xs, vs, tt)
+    r = np.abs(xn - xs)
+    wd2 = w * (r**2 + 2 * r * (np.abs(xn) + np.abs(xs)))
+    fs = float(np.sum(np.abs(np.log(w)) + wd2) + np.sum(np.abs(np.log(Wn))))
+    return fs, np.sum(w * (wd2 + 1.0 + w / Wn), axis=1)
+
+
+def seq_objective(u, t12, xs, vs, scales: bool = False):
+    """(−ell, gradient) of the 3-star in u = (t_1a, log t_aR), t_2a = t12 − t_1a (TH:5219-5226).
+
+    ``scales``: also (value scale, per-coordinate gradient scale) of ``_scales``, chain rule to u.
+    """
     tt = np.array([u[0], t12 - u[0], np.exp(u[1])])
     fv, g = _neg_ell(tt, xs, vs)
-    return fv, np.array([g[0] - g[1], tt[2] * g[2]])
+    out = fv, np.array([g[0] - g[1], tt[2] * g[2]])
+    if not scales:
+        return out
+    fs, gs = _scales(tt, xs, vs)
+    return *out, fs, np.array([gs[0] + gs[1], tt[2] * gs[2]])
 
 
-def joint_objective(s, xs, vs):
-    """(−ell, gradient) of the 3-star in s = log t (TH:5241-5246)."""
+def joint_objective(s, xs, vs, scales: bool = False):
+    """(−ell, gradient) of the 3-star in s = log t (TH:5241-5246); ``scales`` as in ``seq_objective``."""
     tt = np.exp(s)
     fv, g = _neg_ell(tt, xs, vs)
-    return fv, tt * g
+    if not scales:
+        return fv, tt * g
+    fs, gs = _scales(tt, xs, vs)
+    return fv, tt * g, fs, tt * gs
 
 
 def pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode: str = "sequential") -> PairScore:
     """3-leaf score of merging children 1, 2 of a parent with AIR message (xr, Wr) (TH:5362-5408).
 
-    Sequential falls back to joint when t_12 has no bracket or when ``_minimise_box`` fails its KKT
-    test after all restarts; upstream falls back on scipy's ``success=False`` at its loose tolerance
-    (docs/deviations.md). Raises ValueError when the parent has no third child (W_R not positive).
+    Sequential falls back to joint when t_12 has no bracket or when ``_minimise_box`` fails its
+    resolution-scaled KKT test after all restarts; upstream falls back on scipy's ``success=False``
+    at its loose tolerance (docs/deviations.md). Raises ValueError when the parent has no third child (W_R not positive).
     """
     w1, w2 = 1.0 / (t1 + v1), 1.0 / (t2 + v2)
     if np.any((Wr - w1) - w2 <= 4 * np.finfo(float).eps * Wr):  # 2-child parent: W_R is rounding noise, ≤ eps·W_r
@@ -83,21 +116,26 @@ def pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode: str = "sequential") -> Pair
     xR, WR = rest_of_parent(xr, Wr, x1, w1, x2, w2)
     xs, vs = np.stack([x1, x2, xR]), np.stack([v1, v2, 1.0 / WR])
     seq0, joint0 = init_times(t1, t2)
+    rtol = (KKT_EPS_FACTOR + xs.shape[1]) * EPS64
     times, ok = np.array(joint0), False
     if mode == "sequential":
         t12, ok = two_leaf_time(x1, v1, x2, v2)
         if ok and t12 is not None:
             u, ok = _minimise_box(
-                lambda u: seq_objective(u, t12, xs, vs),
+                lambda u, sc=False: seq_objective(u, t12, xs, vs, sc),
                 [0.5 * t12, np.log(max(seq0[1], 1e-4))],
                 [(0.0, t12), (LOG_T_MIN, LOG_T_MAX)],
+                rtol,
             )
             times = np.array([u[0], t12 - u[0], np.exp(u[1])])
     elif mode != "joint":
         raise ValueError(f"mode must be 'sequential' or 'joint', got {mode!r}")
     if not ok:  # joint mode, or the sequential fallback (TH:4822-4831)
         s, ok = _minimise_box(
-            lambda s: joint_objective(s, xs, vs), np.log(np.maximum(joint0, 1e-4)), [(LOG_T_MIN, LOG_T_MAX)] * 3
+            lambda s, sc=False: joint_objective(s, xs, vs, sc),
+            np.log(np.maximum(joint0, 1e-4)),
+            [(LOG_T_MIN, LOG_T_MAX)] * 3,
+            rtol,
         )
         times = np.exp(s)
     if not ok:
@@ -108,14 +146,56 @@ def pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode: str = "sequential") -> Pair
     return PairScore(ell_new - ell_old, times, True, xs, vs, w_old)
 
 
-KKT_RTOL = 1e-8  # reference optimum: max|projected grad| <= 1e-8·(1 + |f|), ~1e4 × the fp64 noise floor
+def _kkt(f, u, lo, hi):
+    """(r, f, value scale, gradient, free mask): r = max over free coordinates of |g_i|/gscale_i.
+
+    A coordinate on a bound with an outward gradient, or in a zero-width box (t_12 = 0), is not free.
+    """
+    fv, g, fs, gs = f(u, True)
+    # (hi > lo) is defensive: a zero-width box (t_12 = 0) already has u on both bounds, so only an
+    # exactly zero gradient could leave it free, and the polish would then divide by h = 0
+    free = (hi > lo) & ~(((u <= lo) & (g > 0)) | ((u >= hi) & (g < 0)))
+    return float(np.max(np.where(free, np.abs(g) / gs, 0.0))), fv, fs, g, free
 
 
-def _minimise_box(f, u0, box, restarts: int = 5):
-    """Tight L-BFGS-B, restarted from its own result until the projected-gradient KKT test passes.
+def _polish(f, u, lo, hi, rtol, iters: int = 20):
+    """Projected Newton on the free coordinates with a forward-FD Hessian of the analytic gradient.
 
-    scipy's own ``success`` flag is not used: with ftol at machine precision it often reports a
-    line-search stop at a point that is optimal, and sometimes stops early (seen in joint mode).
+    L-BFGS-B stops where f's decreases fall below its rounding (ftol), which can leave a gradient
+    far above its own rounding, and it crawls along a log t tail heading for LOG_T_MIN (gradient
+    and curvature ∝ t). The gradient stays resolved there, so a step is kept when it lowers r
+    without raising f beyond the rounding of two evaluations, 2·rtol·fscale.
+    """
+    r, fv, fs, g, free = _kkt(f, u, lo, hi)
+    for _ in range(iters):
+        if r <= rtol:
+            break
+        idx = np.flatnonzero(free)
+        H = np.empty((len(idx), len(idx)))
+        for a, i in enumerate(idx):
+            h = min(1e-5 * max(1.0, abs(u[i])), 0.5 * (hi[i] - lo[i]))
+            e = np.zeros_like(u)
+            e[i] = h if u[i] - lo[i] < hi[i] - u[i] else -h  # step into the box
+            H[:, a] = (f(u + e)[1][idx] - g[idx]) / e[i]
+        H = 0.5 * (H + H.T)
+        try:
+            np.linalg.cholesky(H)  # not positive definite: no Newton step (the solve has failed here)
+        except np.linalg.LinAlgError:
+            break
+        un = u.copy()
+        un[idx] = np.clip(u[idx] - np.linalg.solve(H, g[idx]), lo[idx], hi[idx])
+        rn, fn, fsn, gn, freen = _kkt(f, un, lo, hi)
+        if rn >= r or fn > fv + 2 * rtol * max(fs, fsn):
+            break
+        u, r, fv, fs, g, free = un, rn, fn, fsn, gn, freen
+    return u, r
+
+
+def _minimise_box(f, u0, box, rtol, restarts: int = 5):
+    """Tight L-BFGS-B, then ``_polish``, restarted until the resolution-scaled KKT test r <= rtol passes.
+
+    ``f(u, scales)`` as ``seq_objective``. scipy's own ``success`` flag is not used: with ftol at
+    machine precision it often reports a line-search stop at a point that is optimal.
     """
     lo, hi = np.array(box, dtype=float).T
     u = np.clip(np.asarray(u0, dtype=float), lo, hi)
@@ -123,9 +203,8 @@ def _minimise_box(f, u0, box, restarts: int = 5):
         u = minimize(
             f, u, jac=True, method="L-BFGS-B", bounds=box, options={"ftol": 1e-15, "gtol": 1e-11, "maxiter": 10_000}
         ).x
-        fv, g = f(u)
-        pg = np.where(((u <= lo) & (g > 0)) | ((u >= hi) & (g < 0)), 0.0, g)
-        if np.max(np.abs(pg)) <= KKT_RTOL * (1.0 + abs(fv)):
+        u, r = _polish(f, u, lo, hi, rtol)
+        if r <= rtol:
             return u, True
     return u, False
 

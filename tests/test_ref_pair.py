@@ -5,7 +5,7 @@ from bonsai._core import tree_helpers as th
 from bonsai._core.helpers import calcTInit
 from bonsai._ref import pair as ref_pair
 from bonsai._ref.pair import (
-    KKT_RTOL,
+    KKT_EPS_FACTOR,
     LOG_T_MAX,
     LOG_T_MIN,
     init_times,
@@ -19,7 +19,7 @@ from bonsai._ref.pair import (
 from bonsai._ref.star import node_message
 from bonsai._ref.tree import tree_loglik
 
-from ._bounds import EPS64
+from ._bounds import EPS64, rounded
 
 
 def _parent(rng, C=12, G=40):
@@ -92,6 +92,9 @@ def test_reference_optimum_satisfies_kkt_by_finite_differences(mode):
         f = lambda uu: ell(np.exp(uu))
         lo, hi = np.full(3, LOG_T_MIN), np.full(3, LOG_T_MAX)
     scale = 3 * abs(f(u)) + s.xs.size
+    obj = (lambda uu: seq_objective(uu, t12, s.xs, s.vs, True)) if mode == "sequential" else None
+    obj = obj or (lambda uu: joint_objective(uu, s.xs, s.vs, True))
+    stop = (KKT_EPS_FACTOR + s.xs.shape[1]) * EPS64 * obj(u)[3]  # the reference's stopping rule
     for i in range(len(u)):
         if u[i] <= lo[i] or u[i] >= hi[i]:
             continue  # active bound: checked by the sign of the gradient in the engine tests
@@ -103,47 +106,71 @@ def test_reference_optimum_satisfies_kkt_by_finite_differences(mode):
             return (f(up) - f(um)) / (2 * h)
 
         h = 1e-4 * max(abs(u[i]), 1e-2)
-        assert abs(fd(h / 2)) <= abs(fd(h) - fd(h / 2)) + 4 * EPS64 * scale / h + 1e-8 * (1 + abs(f(u)))  # + KKT_RTOL
+        assert abs(fd(h / 2)) <= abs(fd(h) - fd(h / 2)) + 4 * EPS64 * scale / h + stop[i]
+
+
+def _check_matches_upstream(x, var, t, xr, Wr, i, j):
+    """Sequential pair (i, j) vs upstream's calcSingleDLogL(tol=1e-9) (TH:5362-5408), which stops
+    early (scipy ftol/gtol 1e-9, brentq rtol 1e-9) at times t_up near ours. Both scores share
+    ell_old, so the difference is ell_new(t_ref) − ell_new(t_up), bounded by Taylor at t_up:
+    |g_up·Δt| + ½·‖g_up − g_ref‖·‖Δt‖ (secant curvature) + the rounding of two fp64 evaluations,
+    16·eps64·Σ|terms|. Upstream did not fall back (its t_1a + t_2a is its own t_12), and neither did
+    the reference (t_1a + t_2a = t_12 to one rounding)."""
+    from bonsai._ref.star import star_loglik_grad
+
+    s = pair_score(x[i], var[i], t[i], x[j], var[j], t[j], xr, Wr)
+    w1, w2 = 1 / (t[i] + var[i]), 1 / (t[j] + var[j])
+    rest = (Wr - w1, xr * Wr - w1 * x[i], x[j], var[j], w2, t[j])
+    up_dl, up_t = th.calcSingleDLogL(xr, Wr, x[i], var[i], w1, t[i], *rest, sequential=True, tol=1e-9)
+    assert s.converged and np.isfinite(up_dl)  # both sides converged (upstream returns −inf otherwise)
+    t_up = np.asarray(up_t, dtype=float)
+    up_t12 = th.getOptTime2LeafTree(x[i], var[i], x[j], var[j], tol=1e-9)[0]
+    assert abs(t_up[0] + t_up[1] - up_t12) <= 2 * EPS64 * up_t12  # upstream stayed sequential
+    t12 = two_leaf_time(x[i], var[i], x[j], var[j])[0]
+    assert abs(s.t[0] + s.t[1] - t12) <= 2 * EPS64 * t12  # so did the reference
+    dt = s.t - t_up
+    g_up, g_ref = star_loglik_grad(s.xs, s.vs, t_up)[1], star_loglik_grad(s.xs, s.vs, s.t)[1]
+    w = 1 / (s.vs + s.t[:, None])
+    xa, Wa = node_message(s.xs, s.vs, s.t)
+    scale = np.sum(1 + np.abs(np.log(w)) + w * (xa - s.xs) ** 2) + np.sum(np.abs(np.log(Wa)))
+    bound = abs(g_up @ dt) + 0.5 * np.linalg.norm(g_up - g_ref) * np.linalg.norm(dt) + 16 * EPS64 * scale
+    assert abs(s.dlogl - up_dl) <= bound
+    assert s.dlogl >= up_dl - 16 * EPS64 * scale  # the tight reference is never worse
+    return s
 
 
 def test_sequential_matches_upstream_calc_single_dlogl():
-    """Upstream's calcSingleDLogL(tol=1e-9) (TH:5362-5408) stops early (scipy ftol/gtol 1e-9,
-    brentq rtol 1e-9), at times t_up near ours. Both scores share ell_old, so the difference is
-    ell_new(t_ref) − ell_new(t_up), bounded by Taylor at t_up: |g_up·Δt| + ½·‖g_up − g_ref‖·‖Δt‖
-    (secant curvature) + the rounding of two fp64 evaluations, 16·eps64·Σ|terms|."""
-    from bonsai._ref.star import star_loglik_grad
-
-    rng = np.random.default_rng(3)
-    x, var, t, xr, Wr = _parent(rng)
+    x, var, t, xr, Wr = _parent(np.random.default_rng(3))
     for i, j in [(0, 1), (2, 5), (7, 3)]:
-        s = pair_score(x[i], var[i], t[i], x[j], var[j], t[j], xr, Wr)
-        w1, w2 = 1 / (t[i] + var[i]), 1 / (t[j] + var[j])
-        up_dl, up_t = th.calcSingleDLogL(
-            xr,
-            Wr,
-            x[i],
-            var[i],
-            w1,
-            t[i],
-            Wr - w1,
-            xr * Wr - w1 * x[i],
-            x[j],
-            var[j],
-            w2,
-            t[j],
-            sequential=True,
-            tol=1e-9,
-        )
-        assert s.converged and np.isfinite(up_dl)  # both sides converged (upstream returns −inf otherwise)
-        t_up = np.asarray(up_t, dtype=float)
-        dt = s.t - t_up
-        g_up, g_ref = star_loglik_grad(s.xs, s.vs, t_up)[1], star_loglik_grad(s.xs, s.vs, s.t)[1]
-        w = 1 / (s.vs + s.t[:, None])
-        xa, Wa = node_message(s.xs, s.vs, s.t)
-        scale = np.sum(1 + np.abs(np.log(w)) + w * (xa - s.xs) ** 2) + np.sum(np.abs(np.log(Wa)))
-        bound = abs(g_up @ dt) + 0.5 * np.linalg.norm(g_up - g_ref) * np.linalg.norm(dt) + 16 * EPS64 * scale
-        assert abs(s.dlogl - up_dl) <= bound
-        assert s.dlogl >= up_dl - 16 * EPS64 * scale  # the tight reference is never worse
+        _check_matches_upstream(x, var, t, xr, Wr, i, j)
+
+
+def _task12_family(seed):
+    """The 12-child families of the kernel tests (tests/test_engine_pair.py ``_family``): centred,
+    rounded to float32 as the kernel sees them, parent message in fp64."""
+    rng = np.random.default_rng(seed)
+    x, var, t = rng.normal(0.0, 1.0, (12, 40)), rng.uniform(0.05, 0.6, (12, 40)), rng.uniform(0.05, 0.8, 12)
+    x, var, t = (rounded(a, np.dtype(np.float32)) for a in (x - x.mean(axis=0), var, t))
+    return x, var, t, *node_message(x, var, t)
+
+
+# Sequential solves where the old absolute stop, 1e-8·(1 + |f|), fell back to joint although upstream
+# stayed sequential (L-BFGS-B ends by ftol with |g| ~ 1e-6 above that threshold), or stopped short on
+# a log t_aR tail at −15.95 … −16.06 instead of LOG_T_MIN (Task 12 report, Concern 1).
+SPURIOUS_FALLBACKS = [(100, 0, 10), (106, 1, 2), (109, 6, 7), (111, 7, 8), (115, 2, 6)]
+FLAT_TAILS = [(101, 6, 9), (106, 0, 8), (112, 1, 8), (113, 0, 3)]
+
+
+@pytest.mark.parametrize(("seed", "i", "j"), SPURIOUS_FALLBACKS + FLAT_TAILS)
+def test_sequential_stays_sequential_and_matches_upstream(seed, i, j):
+    """The resolution-scaled stop accepts the optimum fp64 resolves: no fallback, agreement with
+    upstream. On a flat tail the gradient is ∝ t but resolved (r = |g|/gscale is O(1)), so the
+    solve continues to the bound: log t_aR = LOG_T_MIN with an outward gradient."""
+    x, var, t, xr, Wr = _task12_family(seed)
+    s = _check_matches_upstream(x, var, t, xr, Wr, i, j)
+    if (seed, i, j) in FLAT_TAILS:
+        u = np.array([s.t[0], np.log(s.t[2])])
+        assert u[1] == LOG_T_MIN and seq_objective(u, s.t[0] + s.t[1], s.xs, s.vs)[1][1] > 0
 
 
 def test_ub_slopes_match_upstream_and_finite_differences():
@@ -284,7 +311,7 @@ def test_objective_gradients_match_finite_differences(which):
 def test_all_pairs_converge_with_kkt_signs_and_joint_dominates_interior():
     """Every pair of three simulated parents (3 × 66 pairs) converges in both modes. At every
     coordinate on a bound, the analytic objective gradient (FD-checked above) has the KKT sign within
-    the stopping rule, KKT_RTOL·(1 + |f|). On pairs whose times are all inside the joint box in both
+    the stopping rule, (KKT_EPS_FACTOR + G)·eps64·Σ_g|terms of g_i|. On pairs whose times are all inside the joint box in both
     modes, dLogL(joint) ≥ dLogL(seq) − tol. Joint is not a strict superset of sequential (sequential
     allows t_2a = 0 and fixes t_12; joint keeps t ≥ 1e-7 and has its own upper box), hence the
     interior restriction. tol: the joint optimum is stationary within its stopping rule; first-order
@@ -301,16 +328,18 @@ def test_all_pairs_converge_with_kkt_signs_and_joint_dominates_interior():
                 assert sq.converged and jt.converged, (seed, i, j)
                 # joint: s = log t in [LOG_T_MIN, LOG_T_MAX]^3
                 sj = np.log(jt.t)
-                fj, gj = joint_objective(sj, jt.xs, jt.vs)
-                kkt = KKT_RTOL * (1 + abs(fj))
-                assert np.all(gj[sj <= LOG_T_MIN] >= -kkt) and np.all(gj[sj >= LOG_T_MAX] <= kkt)
+                fj, gj, _, gsj = joint_objective(sj, jt.xs, jt.vs, True)
+                kkt = (KKT_EPS_FACTOR + x.shape[1]) * EPS64 * gsj
+                assert np.all(gj[sj <= LOG_T_MIN] >= -kkt[sj <= LOG_T_MIN]) and np.all(
+                    gj[sj >= LOG_T_MAX] <= kkt[sj >= LOG_T_MAX]
+                )
                 # sequential: u = (t_1a in [0, t12], log t_aR in the box)
                 t12 = sq.t[0] + sq.t[1]
                 u = np.array([sq.t[0], np.log(sq.t[2])])
-                fs, gs = seq_objective(u, t12, sq.xs, sq.vs)
-                kkt = KKT_RTOL * (1 + abs(fs))
+                fs, gs, _, gss_ = seq_objective(u, t12, sq.xs, sq.vs, True)
+                kkt = (KKT_EPS_FACTOR + x.shape[1]) * EPS64 * gss_
                 lo, hi = np.array([0.0, LOG_T_MIN]), np.array([t12, LOG_T_MAX])
-                assert np.all(gs[u <= lo] >= -kkt) and np.all(gs[u >= hi] <= kkt)
+                assert np.all(gs[u <= lo] >= -kkt[u <= lo]) and np.all(gs[u >= hi] <= kkt[u >= hi])
                 ss = np.log(sq.t)
                 inside = lambda z: np.all((z > LOG_T_MIN) & (z < LOG_T_MAX))
                 if inside(ss) and inside(sj):
@@ -325,9 +354,49 @@ def test_all_pairs_converge_with_kkt_signs_and_joint_dominates_interior():
     assert n_interior >= 10  # the dominance check ran on a fair share of pairs
 
 
+def test_polish_rejects_a_newton_step_that_raises_f():
+    """f(u) = −cos u on [−10, 10], unit scales, u0 = 1.4: H = cos 1.4 ≈ 0.17 is positive definite, and
+    the Newton step lands at ≈ −4.40, where |g| = |sin u| is smaller (r falls) but f rises from −0.17
+    to +0.31. The polish must keep u0 (its f guard), not trade value for a smaller gradient."""
+
+    def f(u, scales=False):
+        out = -np.cos(u[0]), np.sin(u)
+        return (*out, 1.0, np.ones(1)) if scales else out
+
+    u0 = np.array([1.4])
+    u, _ = ref_pair._polish(f, u0, np.array([-10.0]), np.array([10.0]), 1e-12)
+    assert f(u)[0] <= f(u0)[0]
+
+
+@pytest.mark.parametrize("mode", ["sequential", "joint"])
+def test_pair_score_is_invariant_under_a_large_gene_offset(mode):
+    """dLogL is translation-invariant. At an offset of 1e5 the residuals r = x_n − x_c are formed
+    from numbers of size 1e5, so the gradient's rounding scale must carry the cross term
+    2·w·r·(|x_n| + |x_c|) (``_scales``), or the stopping rule cannot be met. Both solves converge,
+    without a fallback, and agree within the rounding of two dLogL evaluations, (8 + G)·eps64·Σ|terms|
+    each with its cross term (this also covers the input rounding fl(x + 1e5), ≤ eps·1e5/2 per entry).
+    The optimal times differ by ~1e-9 at gradients within the stopping rule, a second-order change."""
+    x, var, t, xr, Wr = _parent(np.random.default_rng(12))
+    G, S = x.shape[1], 1e5
+
+    def scale(s, xr_):
+        r_old = np.abs(xr_ - s.xs)
+        old = np.abs(np.log(s.w_old)) + s.w_old * (r_old**2 + 2 * r_old * (np.abs(xr_) + np.abs(s.xs)))
+        return ref_pair._scales(s.t, s.xs, s.vs)[0] + np.sum(old) + np.sum(np.abs(np.log(Wr)))
+
+    for i, j in [(0, 1), (2, 5), (7, 3)]:
+        s0 = pair_score(x[i], var[i], t[i], x[j], var[j], t[j], xr, Wr, mode=mode)
+        s1 = pair_score(x[i] + S, var[i], t[i], x[j] + S, var[j], t[j], xr + S, Wr, mode=mode)
+        assert s0.converged and s1.converged
+        if mode == "sequential":  # no fallback: t_1a + t_2a = t_12 to one rounding
+            t12 = two_leaf_time(x[i] + S, var[i], x[j] + S, var[j])[0]
+            assert abs(s1.t[0] + s1.t[1] - t12) <= 2 * EPS64 * t12
+        assert abs(s1.dlogl - s0.dlogl) <= (8 + G) * EPS64 * (scale(s0, xr) + scale(s1, xr + S))
+
+
 def test_both_optimisers_failing_gives_minus_inf(monkeypatch):
     """Both solves fail ⇒ dLogL = −∞, t = joint t⁰ = calcTInit(…, False), converged False (TH:5390-5394)."""
-    monkeypatch.setattr(ref_pair, "_minimise_box", lambda f, u0, box: (np.asarray(u0, dtype=float), False))
+    monkeypatch.setattr(ref_pair, "_minimise_box", lambda f, u0, box, rtol: (np.asarray(u0, dtype=float), False))
     x, var, t, xr, Wr = _parent(np.random.default_rng(9))
     s = pair_score(x[0], var[0], t[0], x[1], var[1], t[1], xr, Wr)
     assert s.dlogl == -np.inf and not s.converged

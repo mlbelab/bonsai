@@ -127,17 +127,13 @@ def _lambda_min(f, u, lo, hi):
     return float(np.linalg.eigvalsh(0.5 * (H + H.T))[0])
 
 
-def _check_pairs(dtype, mode, x, var, t, pairs, *, fallback=False, max_flagged=0, ref_fallbacks_ok=False, batch=None):
+def _check_pairs(dtype, mode, x, var, t, pairs, *, fallback=False, max_flagged=0, batch=None):
     """Kernel vs reference on ``pairs``. A pair is flagged if not converged or if its fallback flag
     differs from ``fallback`` (joint times where sequential ones were expected); at most
     ``max_flagged`` may be, and those must still carry their finite last iterate (A11). Every other
-    pair is checked in full (status, KKT, value, active set, UB slopes), except that where the
-    reference's sequential solve fell back to joint (its KKT test is tighter than fp64 resolves on
-    some pairs; see the Task 12 report) and the kernel's did not, there is no reference sequential
-    optimum: those keep the checks that do not use it (KKT under the reference objective, a strict
-    local optimum, UB slopes). ``batch``: the pairs scored in one kernel call (default: ``pairs``
-    padded to P_PAD); vmapped float32 rounding depends on it. Returns (out restricted to ``pairs``,
-    n_flagged, n_reference_fallbacks)."""
+    pair is checked in full (status, KKT, value, active set, UB slopes). ``batch``: the pairs scored
+    in one kernel call (default: ``pairs`` padded to P_PAD); vmapped float32 rounding depends on it.
+    Returns (out restricted to ``pairs``, n_flagged)."""
     eps = float(jnp.finfo(dtype).eps)
     G = x.shape[1]
     batch = batch or (pairs * P_PAD)[: max(P_PAD, len(pairs))]  # pad to the shared shape
@@ -151,17 +147,11 @@ def _check_pairs(dtype, mode, x, var, t, pairs, *, fallback=False, max_flagged=0
     assert np.isfinite(np.asarray(out.dlogl)[:n]).all() and np.isfinite(np.asarray(out.t)[:n]).all()
     omode = "joint" if fallback else mode  # the objective the returned times optimise
     xr_, vr_, tr_, xr, Wr = _ref_parent(x, var, t, dtype)
-    n_ref_fb = 0
     for k, (a, b) in enumerate(pairs):  # padding repeats pairs; only the given ones are checked
         if flagged[k]:
             continue
         ref = rp.pair_score(xr_[a], vr_[a], tr_[a], xr_[b], vr_[b], tr_[b], xr, Wr, mode=mode)
         assert ref.converged
-        ref_fb = False
-        if omode == "sequential":  # a sequential reference optimum has t_1a + t_2a = t_12 (to rounding)
-            t12 = rp.two_leaf_time(xr_[a], vr_[a], xr_[b], vr_[b])[0]
-            ref_fb = abs(ref.t[0] + ref.t[1] - t12) > 8 * EPS64 * t12
-            n_ref_fb += ref_fb
         # 1. first-order optimality of the kernel's times for the reference objective: the kernel
         #    stops at |pg| ≤ (PG_EPS_FACTOR + G)·eps·scale of its own objective, whose gradient
         #    differs from the reference one by its rounding, ≤ (8 + G)·eps·scale (plain gene sum)
@@ -175,30 +165,16 @@ def _check_pairs(dtype, mode, x, var, t, pairs, *, fallback=False, max_flagged=0
         #    (_value_scale), plus the solver gap of the quadratic model, ‖pg‖²/(2·λ_min)
         lam = _lambda_min(f, u, lo, hi)
         assert lam > 0  # a strict local optimum of the reference objective
-        if not ref_fb:
-            gap = float(np.sum(pg_bound**2)) / (2 * lam)
-            assert abs(float(out.dlogl[k]) - ref.dlogl) <= 9 * eps * _value_scale(ref, xr, Wr) + gap
-            # 3. the same active bounds as the reference optimum, up to a flat tail: the reference
-            #    KKT test is absolute, so on a log t heading for its bound (gradient ∝ t) it may stop
-            #    short of it; a coordinate active on one side only must then have, at the other
-            #    side's interior point, a gradient pointing at that bound (value agreement is check 2)
-            f_ref, u_ref, _, _ = _objective(ref, omode)
-            g_ref = f_ref(u_ref)[1]
-            for side, ua, ub_, gb in (
-                (lo, u, u_ref, g_ref),
-                (lo, u_ref, u, g),
-                (hi, u, u_ref, g_ref),
-                (hi, u_ref, u, g),
-            ):
-                tail = (ua == side) & (ub_ != side)  # active in ua only; ub_ interior there
-                sign = 1.0 if side is lo else -1.0
-                assert np.all(sign * gb[tail] > 0)
+        gap = float(np.sum(pg_bound**2)) / (2 * lam)
+        assert abs(float(out.dlogl[k]) - ref.dlogl) <= 9 * eps * _value_scale(ref, xr, Wr) + gap
+        # 3. the same active bounds as the reference optimum
+        _, u_ref, lo_ref, hi_ref = _objective(ref, omode)
+        assert np.array_equal(u == lo, u_ref == lo_ref) and np.array_equal(u == hi, u_ref == hi_ref)
         # 4. upper-bound slopes, evaluated by the reference formula at the kernel's times
         a_ref, b_ref = rp.ub_slopes(at_kernel, xr, Wr)
         tol_a, tol_b = _ub_tols(at_kernel, xr, Wr, eps)
         assert abs(float(out.a[k]) - a_ref) <= tol_a and abs(float(out.b[k]) - b_ref) <= tol_b
-    assert ref_fallbacks_ok or n_ref_fb == 0
-    return out, int(flagged.sum()), n_ref_fb
+    return out, int(flagged.sum())
 
 
 def _ub_tols(s, xr, Wr, eps):
@@ -393,7 +369,7 @@ def test_convergence_rate_on_fresh_families(mode):
     flagged = 0
     for seed in range(100, 120):
         x, var, t = _family(np.random.default_rng(seed))
-        kw = {"max_flagged": len(pairs), "ref_fallbacks_ok": True, "batch": pairs}
+        kw = {"max_flagged": len(pairs), "batch": pairs}
         flagged += _check_pairs(jnp.float32, mode, x, var, t, pairs, **kw)[1]
     assert flagged <= MAX_FLAGGED
 
@@ -430,7 +406,7 @@ def test_budget_limited_stall_is_flagged(monkeypatch, mode, budget):
     monkeypatch.setattr(kernel, "N_NEWTON", budget)
     jax.clear_caches()
     try:
-        kw = {"max_flagged": len(pairs) - 1, "ref_fallbacks_ok": True, "batch": pairs}
+        kw = {"max_flagged": len(pairs) - 1, "batch": pairs}
         assert _check_pairs(jnp.float32, mode, x, var, t, pairs, **kw)[1] >= 1
     finally:
         monkeypatch.undo()

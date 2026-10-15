@@ -96,13 +96,20 @@
   rule or iteration order.
 
 ## Phase 2 fp64 references (`bonsai._ref.pair`, not used by `_core`)
-- Tight optimiser: the reference 3-leaf solves define the optimum. They run L-BFGS-B at machine precision
-  (ftol 1e-15, gtol 1e-11) and restart until max|projected gradient| ≤ 1e-8·(1 + |f|). Upstream scores
-  pairs at tol 1e-4 (TH:1303). The 2-leaf time uses brentq at rtol 4·eps64 instead of tol 1e-4/1e-9.
+- Tight optimiser: the reference 3-leaf solves define the optimum: the exact optimum of upstream's objective
+  (to fp64 resolution), with upstream's own solves (tol 1e-4/1e-9) within their stopping gap of it. They run
+  L-BFGS-B at machine precision (ftol 1e-15, gtol 1e-11), then a projected Newton polish (forward-FD Hessian of the analytic gradient),
+  restarting until every free coordinate has |g_i| ≤ (16 + G)·eps64·Σ_g|terms of g_i|, i.e. a gradient
+  that is zero to its own fp64 rounding. L-BFGS-B alone stops where f's decreases fall below f's rounding,
+  which can leave |g| ~ 1e-6, and it crawls on the flat tail of a log t heading for LOG_T_MIN (gradient ∝ t);
+  the polish takes such a coordinate onto its bound. Upstream scores pairs at tol 1e-4 (TH:1303). The
+  2-leaf time uses brentq at rtol 4·eps64 instead of tol 1e-4/1e-9.
 - Fallback trigger: upstream's sequential mode falls back to the joint solve when scipy reports
-  `success=False` at its loose tolerance (TH:4867, 5381-5385). The reference falls back when its own KKT test
-  still fails after 5 restarts (scipy's flag is not used), or when the t_12 bracket fails. On 264 fixture
-  pairs, review found no pair where the two triggers disagree.
+  `success=False` at its loose tolerance (TH:4867, 5381-5385). The reference falls back when its
+  resolution-scaled KKT test still fails after 5 restarts (scipy's flag is not used), or when the t_12
+  bracket fails. On the 1320 sequential pairs of the kernel test families (rng 100-119), neither falls back
+  (upstream at tol 1e-4 and 1e-9). The earlier absolute test, 1e-8·(1 + |f|), fell back on 5 of them where
+  upstream did not.
 - 2-leaf bracket: upstream raises `BonsaiError` once f(ub) > 1e9 during the ×10 bracket expansion
   (TH:4917-4919). The reference has no such check: it returns (None, not converged) once lb > 1e6, and
   `pair_score` falls back to the joint solve. This is reachable only for Σ_g d² ≳ 1e11 (e.g. x1 = 0,
