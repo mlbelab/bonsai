@@ -1,0 +1,13 @@
+# M0 baseline: upstream backend (today's tl.reconstruct, upstream defaults) on simulated 10k x 2k.
+[run]
+name = "upstream_sim_10k"
+seed = 0
+backend = "upstream"
+n_warm = 0
+
+[data]
+kind = "simulate"
+n_cells = 10000
+n_genes = 2000
+
+[upstream]
