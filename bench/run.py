@@ -27,7 +27,7 @@ import jax
 import numpy as np
 
 from bonsai import pp, tl
-from bonsai._ref.newick import parse_newick
+from bonsai._ref.newick import children_lists, parse_newick
 from bonsai._ref.tree import tree_loglik
 
 from . import metadata
@@ -92,8 +92,7 @@ def load_data(cfg: dict):
     kind = data.pop("kind")
     if kind == "simulate":
         sim = simulate(seed=cfg["run"]["seed"], **data)
-        names = [*sim.adata.obs_names, *(f"internal_{i}" for i in range(sim.adata.n_obs - 2)), "root"]
-        return sim.adata, (sim.parent, names)
+        return sim.adata, (sim.parent, sim.names)
     path = Path(data["path"])
     if not path.exists():
         raise ConfigError(f"data path does not exist: {path}")
@@ -163,6 +162,31 @@ class _StageLog(logging.Handler):
                 _write_json(self.partial, {"stages_s": self.stages})
 
 
+def _leaf_arrays(parent: np.ndarray, names: list[str], cell_ids: list[str], x: np.ndarray, var: np.ndarray):
+    """Node-indexed ``(X, V)`` for ``tree_loglik``: newick leaves get ``x``/``var`` rows by ``cell_ids`` order.
+
+    ``cell_ids`` must be exactly the newick's leaf-name set (upstream's own
+    ``processed/metadata.json`` ``cellIds``, i.e. ``delta.npy``'s row order); a leaf name missing
+    from ``cell_ids``, or vice versa, raises instead of silently defaulting to ``x=0, var=1``. A
+    name present in ``cell_ids`` must also label a leaf (no children) in the newick.
+    """
+    kids = children_lists(parent)
+    leaves = {names[i] for i in range(len(parent)) if not kids[i]}
+    if leaves != set(cell_ids):
+        raise ValueError(
+            "newick leaf names do not match the processed cell order: "
+            f"missing from newick {set(cell_ids) - leaves}, unexpected in newick {leaves - set(cell_ids)}"
+        )
+    row = {c: i for i, c in enumerate(cell_ids)}
+    X, V = np.zeros((len(parent), x.shape[1])), np.ones((len(parent), x.shape[1]))
+    for node, name in enumerate(names):
+        if name in row:
+            if kids[node]:
+                raise ValueError(f"cell node {name!r} has children in the upstream tree")
+            X[node], V[node] = x[row[name]], var[row[name]]
+    return X, V
+
+
 def run_upstream(adata, upstream_kw: dict, out: Path | None = None, tag: str = "run0") -> dict:
     """One ``tl.reconstruct`` run (backend="upstream"): wall time, stage times, A1 log-likelihood.
 
@@ -202,11 +226,8 @@ def run_upstream(adata, upstream_kw: dict, out: Path | None = None, tag: str = "
     shutil.rmtree(wd, ignore_errors=True)  # only reached on success; a failure or kill leaves wd behind
     res = a.uns["bonsai"]
     parent, t, names = parse_newick(res["newick"])
-    row = {c: i for i, c in enumerate(a.obs_names)}  # delta.npy columns follow the written cell order
-    X, V = np.zeros((len(parent), x.shape[1])), np.ones((len(parent), x.shape[1]))
-    for node, name in enumerate(names):
-        if name in row:
-            X[node], V[node] = x[row[name]], var[row[name]]
+    cell_ids = json.loads((processed / "metadata.json").read_text())["cellIds"]  # delta.npy's own row order
+    X, V = _leaf_arrays(parent, names, cell_ids, x, var)
     L = tree_loglik(parent, t, X, V)
     return {
         "wall_s": wall,
@@ -222,6 +243,9 @@ def run_upstream(adata, upstream_kw: dict, out: Path | None = None, tag: str = "
             "per_entry": L / (a.n_obs * x.shape[1]),
             "upstream_finalLoglik": res["loglik"],
         },
+        # Full-precision newick: kept re-scorable (item 1) because M2 may change how quartets treat
+        # zero-length edges or polytomies, so the baselines must not fix the metric at this commit.
+        "newick": res["newick"],
         "tree": (parent, names),
     }
 

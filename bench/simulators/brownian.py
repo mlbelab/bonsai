@@ -34,6 +34,7 @@ class Simulation:
     adata: AnnData  # cells × genes with the read_sanity slots and uns["bonsai_truth"]
     parent: np.ndarray  # (2N−1,) parent index, −1 at the root; leaves 0..N−1, root 2N−2
     t: np.ndarray  # (2N−1,) branch length above each node, 0 at the root
+    names: list[str]  # (2N−1,) node names, in parent-array order (cells, then internal_i, then root)
     z: np.ndarray  # (2N−1, G) true log expression at every node
     lik_mean: np.ndarray  # (N, G) m
     lik_var: np.ndarray  # (N, G) s2
@@ -94,4 +95,4 @@ def simulate(
     a.var["bonsai_prior_var"], a.var["bonsai_mu"] = v, mu
     a.uns["bonsai_input"] = {"kind": "sanity_posterior", "sanity_version": "simulated", "sanity_method": "MAP"}
     a.uns["bonsai_truth"] = {"newick": to_newick(parent, t, names), "parent": parent, "t": t, "seed": seed}
-    return Simulation(a, parent, t, z, m, s2, lib)
+    return Simulation(a, parent, t, names, z, m, s2, lib)

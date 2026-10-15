@@ -7,6 +7,8 @@ import pytest
 from bench import run
 from bench.simulators.brownian import simulate
 
+from bonsai._ref.newick import parse_newick
+
 CONFIGS = run.metadata.REPO / "bench" / "configs"
 
 
@@ -73,6 +75,40 @@ def test_stage_log_keeps_stages_in_order_and_writes_partial_results(tmp_path):
     assert json.loads((tmp_path / "partial.json").read_text()) == {"stages_s": want}
 
 
+def test_leaf_arrays_maps_rows_by_cell_ids_not_obs_order():
+    """(A-1) rows come from ``cell_ids`` order, which may differ from any other cell ordering."""
+    parent, _, names = parse_newick("((a:1,b:1)x:1,c:1)root;")
+    x = np.array([[1.0], [2.0], [3.0]])  # row i belongs to cell_ids[i]
+    var = np.array([[10.0], [20.0], [30.0]])
+    X, V = run._leaf_arrays(parent, names, ["c", "a", "b"], x, var)
+    want_x = {"a": 2.0, "b": 3.0, "c": 1.0}
+    want_v = {"a": 20.0, "b": 30.0, "c": 10.0}
+    for i, n in enumerate(names):
+        if n in want_x:
+            assert X[i, 0] == want_x[n] and V[i, 0] == want_v[n]
+        else:
+            assert X[i, 0] == 0.0 and V[i, 0] == 1.0  # internal/root default
+
+
+def test_leaf_arrays_rejects_cell_id_mismatch():
+    """(A-1) a leaf name missing from (or extra in) ``cell_ids`` raises instead of defaulting silently."""
+    parent, _, names = parse_newick("((a:1,b:1)x:1,c:1)root;")
+    x = var = np.ones((3, 1))
+    with pytest.raises(ValueError, match="do not match"):
+        run._leaf_arrays(parent, names, ["a", "b", "d"], x, var)  # "d" instead of "c"
+    with pytest.raises(ValueError, match="do not match"):
+        run._leaf_arrays(parent, names, ["a", "b"], x[:2], var[:2])  # "c" missing
+
+
+def test_leaf_arrays_rejects_a_cell_name_on_a_non_leaf_node():
+    """(A-1) a cell name must label a leaf; if upstream ever names an internal node after a cell, raise."""
+    parent, _, names = parse_newick("((a:1,b:1)x:1,c:1)root;")
+    names = [n if n != "x" else "a" for n in names]  # "a" now also labels the internal node x
+    x = var = np.ones((3, 1))
+    with pytest.raises(ValueError, match="has children"):
+        run._leaf_arrays(parent, names, ["a", "b", "c"], x, var)
+
+
 def test_data_path_is_rejected_for_simulated_data(tmp_path):
     with pytest.raises(run.ConfigError, match="only for"):
         run.load_config(CONFIGS / "upstream_sim_1k.toml", data_path=str(tmp_path / "x.h5ad"))
@@ -116,6 +152,9 @@ def test_smoke_run_end_to_end(tmp_path):
     meta = json.loads((out / "metadata.json").read_text())
     (r,) = res["runs"]
     assert r["kind"] == "cold" and r["wall_s"] > 0 and "SPR moves" in [name for name, _ in r["stages_s"]]
+    # (item 1) the full-precision upstream tree is stored, re-scorable without rerunning the baseline.
+    parent, _, _ = parse_newick(r["newick"])
+    assert len(parent) == 2 * 24 - 1 and int((parent < 0).sum()) == 1
     assert json.loads((out / "run0_partial.json").read_text())["stages_s"] == r["stages_s"]
     assert "took" in (out / "run0_upstream.log").read_text()
     ll = r["loglik"]
