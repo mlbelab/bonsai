@@ -14,7 +14,7 @@ from .golden import FIXTURE, GOLDEN, load_tree
 
 def _fp64_tol(parent, t, x, var, n_orders: int = 2) -> float:
     """Two fp64 evaluations of L_tree that sum in different orders differ by ≤ n·8·(1+H)·eps64·A."""
-    _, X, V, _, _ = _upward(parent, t, x, var)
+    _, X, V = _upward(parent, t, x, var)
     return n_orders * 8 * (1 + tree_height(parent)) * EPS64 * loglik_scale(parent, t, X, 1.0 / V)
 
 

@@ -32,6 +32,16 @@ def _version(pkg: str) -> str | None:
         return None
 
 
+def _cpu_model() -> str | None:
+    """``lscpu``'s "Model name", falling back to ``platform.processor()`` (often empty on Linux)."""
+    out = _run("lscpu")
+    if out:
+        for line in out.splitlines():
+            if line.strip().startswith("Model name:"):
+                return line.split(":", 1)[1].strip()
+    return platform.processor() or None
+
+
 def collect(config_path: Path, seed: int) -> dict:
     """Environment and provenance of one benchmark run; unknown fields are None, never an error."""
     # --untracked-files=no: bench/results/ is committed only after Task 5, so every baseline run
@@ -46,6 +56,7 @@ def collect(config_path: Path, seed: int) -> dict:
         "platform": platform.platform(),
         "python": sys.version,
         "cpu_count": os.cpu_count(),
+        "cpu_model": _cpu_model(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "threads": {v: os.environ.get(v) for v in THREAD_VARS},
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),

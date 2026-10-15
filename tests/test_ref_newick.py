@@ -34,7 +34,7 @@ def test_random_trees_round_trip_exactly():
         assert np.array_equal(t2, t[idx])  # repr round-trips float64 exactly
 
 
-@pytest.mark.parametrize("bad", ["((a,b);", "(a,b);(c,d);"])
+@pytest.mark.parametrize("bad", ["((a,b);", "(a,b);(c,d);", "(a,b));"])
 def test_malformed_newick_raises(bad):
     with pytest.raises(ValueError):
         parse_newick(bad)

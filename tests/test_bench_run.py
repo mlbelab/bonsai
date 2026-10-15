@@ -27,9 +27,26 @@ def test_committed_configs_load(name):
 def test_real_config_needs_a_path(tmp_path):
     with pytest.raises(run.ConfigError, match="--data-path"):
         run.load_config(CONFIGS / "real_upstream.toml")
-    cfg = run.load_config(CONFIGS / "real_upstream.toml", data_path=str(tmp_path / "x.h5ad"))
+    # (item 8) the path is checked inside load_config, before any output directory exists.
     with pytest.raises(run.ConfigError, match="does not exist"):
-        run.load_data(cfg)
+        run.load_config(CONFIGS / "real_upstream.toml", data_path=str(tmp_path / "x.h5ad"))
+
+
+def test_real_data_path_is_checked_before_any_output_is_written(tmp_path):
+    """(item 8) a bad --data-path fails before main() creates its output directory."""
+    out = tmp_path / "out"
+    with pytest.raises(run.ConfigError, match="does not exist"):
+        run.main(
+            [
+                "--config",
+                str(CONFIGS / "real_upstream.toml"),
+                "--data-path",
+                str(tmp_path / "missing.h5ad"),
+                "--out",
+                str(out),
+            ]
+        )
+    assert not out.exists()
 
 
 @pytest.mark.parametrize(
@@ -47,6 +64,20 @@ def test_invalid_configs_raise(tmp_path, text, match):
         run.load_config(_write(tmp_path, text))
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[run]\nname='a'\nseed=0\nbackend='upstream'\nn_warmm=1\n[data]\nkind='simulate'\nn_cells=5\nn_genes=4\n",
+        "[run]\nname='a'\nseed=0\nbackend='upstream'\n[data]\nkind='simulate'\nn_cells=5\nn_genes=4\ntypo=1\n",
+        "[run]\nname='a'\nseed=0\nbackend='upstream'\n[data]\nkind='simulate'\nn_cells=5\nn_genes=4\n"
+        "[upstream]\nnnn_n_randommovs=1\n",
+    ],
+)
+def test_unknown_config_keys_are_rejected(tmp_path, text):
+    with pytest.raises(run.ConfigError, match="unknown key"):
+        run.load_config(_write(tmp_path, text))
+
+
 def test_real_h5ad_without_bonsai_slots_is_rejected(tmp_path):
     a = simulate(5, 4, seed=0).adata
     del a.uns["bonsai_input"]
@@ -55,6 +86,13 @@ def test_real_h5ad_without_bonsai_slots_is_rejected(tmp_path):
     cfg = run.load_config(CONFIGS / "real_upstream.toml", data_path=str(tmp_path / "x.h5ad"))
     with pytest.raises(run.ConfigError, match="read_sanity"):
         run.load_data(cfg)
+
+
+def test_stage_log_writes_an_empty_partial_file_immediately(tmp_path):
+    """(item 9) a run capped before its first stage completes still leaves a partial file."""
+    p = tmp_path / "partial.json"
+    run._StageLog(p)
+    assert json.loads(p.read_text()) == {"stages_s": []}
 
 
 def test_stage_log_keeps_stages_in_order_and_writes_partial_results(tmp_path):
@@ -131,13 +169,32 @@ def test_git_dirty_ignores_untracked_files(tmp_path, monkeypatch):
     assert run.metadata.collect(CONFIGS / "smoke_upstream.toml", seed=0)["git_dirty"] is True
 
 
+def test_count_compilations_counts_a_jit_compile():
+    import jax
+    import jax.numpy as jnp
+
+    with run.count_compilations() as c:
+        jax.jit(lambda x: x + 1)(jnp.ones(3))
+    assert c.count >= 1
+
+
 def test_timed_blocks_and_metadata_fields(tmp_path):
     import jax.numpy as jnp
 
     out, s = run.timed(lambda a: a * 2, jnp.ones(3))
     assert s >= 0 and np.asarray(out).tolist() == [2.0, 2.0, 2.0]
     meta = run.metadata.collect(CONFIGS / "smoke_upstream.toml", seed=0)
-    for key in ("git_sha", "gpus", "versions", "seed", "config_sha256", "config_text", "timestamp_utc", "threads"):
+    for key in (
+        "git_sha",
+        "gpus",
+        "versions",
+        "seed",
+        "config_sha256",
+        "config_text",
+        "timestamp_utc",
+        "threads",
+        "cpu_model",
+    ):
         assert key in meta
     assert meta["versions"]["bonsai"] is not None
 

@@ -8,6 +8,7 @@ log lines. Log-likelihoods follow amendment A1 (see ``LOGLIK_CONVENTION``).
 """
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -43,6 +44,10 @@ BACKENDS = ("upstream",)
 DATA_KINDS = ("simulate", "real")
 _STAGE = re.compile(r"^(?P<stage>.+?) took (?P<s>[0-9.eE+-]+) seconds\.?$")
 
+_RUN_KEYS = {"name", "seed", "backend", "n_warm"}
+_DATA_KEYS = {"kind", "path"} | (set(inspect.signature(simulate).parameters) - {"seed"})
+_UPSTREAM_KEYS = set(inspect.signature(tl.reconstruct).parameters) - {"adata", "workdir", "keep_workdir", "copy"}
+
 
 class ConfigError(ValueError):
     """Invalid or incomplete benchmark config."""
@@ -55,6 +60,12 @@ def _write_json(path: Path, data) -> None:
     os.replace(tmp, path)
 
 
+def _reject_unknown_keys(section: dict, known: set[str], name: str) -> None:
+    extra = set(section) - known
+    if extra:
+        raise ConfigError(f"unknown key(s) in [{name}]: {sorted(extra)}")
+
+
 def load_config(path: Path, data_path: str | None = None) -> dict:
     """Parse and validate a TOML config; ``data_path`` overrides ``[data].path``."""
     try:
@@ -63,12 +74,14 @@ def load_config(path: Path, data_path: str | None = None) -> dict:
         raise ConfigError(f"config not found: {path}") from None
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"invalid TOML in {path}: {e}") from None
+    _reject_unknown_keys(cfg.get("run", {}), _RUN_KEYS, "run")
     for key in ("name", "seed", "backend"):
         if key not in cfg.get("run", {}):
             raise ConfigError(f"missing [run].{key}")
     if cfg["run"]["backend"] not in BACKENDS:
         raise ConfigError(f"[run].backend must be one of {BACKENDS}, got {cfg['run']['backend']!r}")
     data = cfg.setdefault("data", {})
+    _reject_unknown_keys(data, _DATA_KEYS, "data")
     if data.get("kind") not in DATA_KINDS:
         raise ConfigError(f"[data].kind must be one of {DATA_KINDS}, got {data.get('kind')!r}")
     if data_path is not None:
@@ -79,10 +92,16 @@ def load_config(path: Path, data_path: str | None = None) -> dict:
         for key in ("n_cells", "n_genes"):
             if key not in data:
                 raise ConfigError(f"missing [data].{key} for kind = 'simulate'")
-    elif not data.get("path"):
-        raise ConfigError("[data].kind = 'real' needs [data].path or --data-path (an .h5ad file or a Sanity folder)")
+    else:
+        if not data.get("path"):
+            raise ConfigError(
+                "[data].kind = 'real' needs [data].path or --data-path (an .h5ad file or a Sanity folder)"
+            )
+        if not Path(data["path"]).exists():  # (item 8) checked here, before any output dir/metadata.json exists
+            raise ConfigError(f"data path does not exist: {data['path']}")
     cfg["run"].setdefault("n_warm", 0)
     cfg.setdefault("upstream", {})
+    _reject_unknown_keys(cfg["upstream"], _UPSTREAM_KEYS, "upstream")
     return cfg
 
 
@@ -93,9 +112,7 @@ def load_data(cfg: dict):
     if kind == "simulate":
         sim = simulate(seed=cfg["run"]["seed"], **data)
         return sim.adata, (sim.parent, sim.names)
-    path = Path(data["path"])
-    if not path.exists():
-        raise ConfigError(f"data path does not exist: {path}")
+    path = Path(data["path"])  # existence already checked by load_config (item 8)
     adata = pp.read_sanity(path) if path.is_dir() else ad.read_h5ad(path)
     if "bonsai_input" not in adata.uns:
         raise ConfigError(
@@ -145,14 +162,16 @@ class _StageLog(logging.Handler):
     """Collects upstream's '<stage> took <s> seconds.' log lines (helpers.py logger 'myapp').
 
     Stages are kept in order of occurrence ("Optimization of diffusion times" happens twice).
-    With ``partial`` set, every new stage rewrites that JSON file, so a run killed by its time cap
-    still leaves the stage times it reached.
+    With ``partial`` set, the file is written immediately (empty) and every new stage rewrites
+    it, so a run killed before its first stage completes still leaves one (item 9).
     """
 
     def __init__(self, partial: Path | None = None):
         super().__init__(logging.INFO)
         self.stages: list[list] = []  # [stage, seconds], in order
         self.partial = partial
+        if self.partial is not None:
+            _write_json(self.partial, {"stages_s": self.stages})
 
     def emit(self, record):
         m = _STAGE.match(record.getMessage().strip())
@@ -261,7 +280,7 @@ def main(argv: list[str] | None = None) -> Path:
     meta = metadata.collect(args.config, cfg["run"]["seed"])
     out = args.out / cfg["run"]["name"] / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True)
-    (out / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")  # first, so a capped run keeps it
+    _write_json(out / "metadata.json", meta)  # first, so a capped run keeps it
     adata, truth = load_data(cfg)
     runs = []
     for i in range(1 + cfg["run"]["n_warm"]):

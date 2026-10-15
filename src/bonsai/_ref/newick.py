@@ -27,6 +27,8 @@ def parse_newick(s: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
             open_nodes.append(len(parent) - 1)
             last = -1
         elif tok == ")":
+            if not open_nodes:
+                raise ValueError("unbalanced parentheses in newick string: extra ')'")
             last = open_nodes.pop()
         elif tok in ",;":
             last = -1

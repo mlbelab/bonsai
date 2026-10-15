@@ -1,4 +1,4 @@
-"""fp64 NumPy reference: Bonsai tree log-likelihood and its gradient (maths ref §2, §4).
+"""fp64 NumPy reference: Bonsai tree log-likelihood (maths ref §2, §4; the gradient arrives in Task 8).
 
 Convention (amendment A1): upstream's ``finalLoglik`` units, i.e. the sum over internal nodes of
 ell_n (TH:3383-3392) = 2 x Gaussian log marginal likelihood + (N-1)·G·log(2π), with no
@@ -29,7 +29,14 @@ def postorder(parent: np.ndarray) -> tuple[np.ndarray, list[list[int]]]:
 
 
 def _upward(parent, t, x, var):
-    """Post-order pass (TH:629-653, 5257-5294): node messages (x_n, W_n) and L_tree."""
+    """Post-order pass (TH:629-653, 5257-5294): node messages (x_n, W_n) and L_tree.
+
+    ponytail: allocates and copies full (2N-1, G) arrays even though only internal rows are
+    written; `tests/_bounds.py:loglik_scale` indexes the returned X/W by both leaf and internal
+    node id, so shrinking this to internal-only storage means changing that contract too.
+    Upgrade path (M4): a node-message type (leaf view + internal array) once that caller is
+    revisited for scale.
+    """
     order, kids = postorder(parent)
     t = np.asarray(t, dtype=np.float64)
     X = np.array(x, dtype=np.float64)
@@ -45,7 +52,7 @@ def _upward(parent, t, x, var):
         # ell_n = Σ_g [Σ_c log w_c − log W − Σ_c w_c (x − x_c)^2]  (TH:5093-5105)
         L += float(np.sum(np.log(w).sum(axis=0) - np.log(Wn) - (w * (xn - X[ch]) ** 2).sum(axis=0)))
         X[n], V[n] = xn, 1.0 / Wn
-    return L, X, V, order, kids
+    return L, X, V
 
 
 def tree_loglik(parent: np.ndarray, t: np.ndarray, x: np.ndarray, var: np.ndarray) -> float:
