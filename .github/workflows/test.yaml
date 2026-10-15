@@ -95,8 +95,7 @@ jobs:
           MPLBACKEND: agg
           JAX_PLATFORMS: cpu
           JAX_ENABLE_X64: "1"
-        # exit code 5 = no tests collected (M0 has no x64 test yet)
-        run: uv run --locked pytest -v --color=yes -m "x64 and not gpu" || test $? -eq 5
+        run: uv run --locked pytest -v --color=yes -m "x64 and not gpu"
 
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
   # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
