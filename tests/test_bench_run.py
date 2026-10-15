@@ -7,7 +7,7 @@ import pytest
 from bench import run
 from bench.simulators.brownian import simulate
 
-from bonsai._ref.newick import parse_newick
+from bonsai._ref.newick import children_lists, parse_newick
 
 CONFIGS = run.metadata.REPO / "bench" / "configs"
 
@@ -210,8 +210,11 @@ def test_smoke_run_end_to_end(tmp_path):
     (r,) = res["runs"]
     assert r["kind"] == "cold" and r["wall_s"] > 0 and "SPR moves" in [name for name, _ in r["stages_s"]]
     # (item 1) the full-precision upstream tree is stored, re-scorable without rerunning the baseline.
+    # Upstream's tree may have polytomies, so only the root count and leaf count are checked.
     parent, _, _ = parse_newick(r["newick"])
-    assert len(parent) == 2 * 24 - 1 and int((parent < 0).sum()) == 1
+    kids = children_lists(parent)
+    assert int((parent < 0).sum()) == 1
+    assert sum(1 for k in kids if not k) == 24
     assert json.loads((out / "run0_partial.json").read_text())["stages_s"] == r["stages_s"]
     assert "took" in (out / "run0_upstream.log").read_text()
     ll = r["loglik"]

@@ -237,6 +237,7 @@ def run_upstream(adata, upstream_kw: dict, out: Path | None = None, tag: str = "
         wall = time.perf_counter() - t0
         (processed,) = wd.rglob("zscorefiltered_*_and_processed")
         x, var = np.load(processed / "delta.npy").T, np.load(processed / "delta_vars.npy").T  # cells × genes
+        cell_ids = json.loads((processed / "metadata.json").read_text())["cellIds"]  # delta.npy's own row order
     finally:
         for h in handlers:
             logger.removeHandler(h)
@@ -245,7 +246,6 @@ def run_upstream(adata, upstream_kw: dict, out: Path | None = None, tag: str = "
     shutil.rmtree(wd, ignore_errors=True)  # only reached on success; a failure or kill leaves wd behind
     res = a.uns["bonsai"]
     parent, t, names = parse_newick(res["newick"])
-    cell_ids = json.loads((processed / "metadata.json").read_text())["cellIds"]  # delta.npy's own row order
     X, V = _leaf_arrays(parent, names, cell_ids, x, var)
     L = tree_loglik(parent, t, X, V)
     return {
