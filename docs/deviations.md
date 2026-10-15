@@ -94,3 +94,18 @@
   `verbose` only gates extra `mp_print`/logger output inside `_core` (e.g. `main.py:148`, `main.py:157`,
   `storeTreeInFolder(..., verbose=args.verbose)` calls); it does not change any numeric result, decision
   rule or iteration order.
+
+## Phase 2 fp64 references (`bonsai._ref.pair`, not used by `_core`)
+- Tight optimiser: the reference 3-leaf solves define the optimum. They run L-BFGS-B at machine precision
+  (ftol 1e-15, gtol 1e-11) and restart until max|projected gradient| ≤ 1e-8·(1 + |f|). Upstream scores
+  pairs at tol 1e-4 (TH:1303). The 2-leaf time uses brentq at rtol 4·eps64 instead of tol 1e-4/1e-9.
+- Fallback trigger: upstream's sequential mode falls back to the joint solve when scipy reports
+  `success=False` at its loose tolerance (TH:4867, 5381-5385). The reference falls back when its own KKT test
+  still fails after 5 restarts (scipy's flag is not used), or when the t_12 bracket fails. On 264 fixture
+  pairs, review found no pair where the two triggers disagree.
+- 2-leaf bracket: upstream raises `BonsaiError` once f(ub) > 1e9 during the ×10 bracket expansion
+  (TH:4917-4919). The reference has no such check: it returns (None, not converged) once lb > 1e6, and
+  `pair_score` falls back to the joint solve. This is reachable only for Σ_g d² ≳ 1e11 (e.g. x1 = 0,
+  x2 = 2e5, v = 0.1, G = 4), never for normalised data.
+- `pair_score` raises `ValueError` when the parent has no third child, i.e. W_r − w_1 − w_2 ≤ 4·eps·W_r.
+  Upstream would continue with W_R ≈ 0 and produce NaN or inf.
