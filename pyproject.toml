@@ -27,14 +27,19 @@ classifiers = [
 ]
 dependencies = [
   "anndata>=0.13",
+  "equinox>=0.13.8",
+  "jax>=0.11.2",
+  "jaxtyping>=0.3.11",
   "matplotlib>=3.8",
   "numpy>=2",
+  "optimistix>=0.1.0,<0.2",  # A9: opt_times reads an optimistix-internal field
   "pandas>=2.2",
   "psutil>=5.9",
   "ruamel-yaml>=0.18",
   "scikit-learn>=1.5",
   "scipy>=1.13",
 ]
+optional-dependencies.cuda12 = [ "jax[cuda12]>=0.11.2" ]
 optional-dependencies.mpi = [ "mpi4py>=4" ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Homepage = "https://github.com/mlbelab/bonsai"
@@ -72,7 +77,7 @@ typecheck = [
 # The golden fixture .npy files are force-un-ignored in .gitignore (`!tests/data/golden_b16ef6f/*.npy`,
 # needed so git itself tracks them); that negation also overrides a plain "/tests" sdist exclude, so list
 # them explicitly here too.
-build.targets.sdist.exclude = [ "/docs", "/tests", "tests/data/golden_b16ef6f/*.npy" ]
+build.targets.sdist.exclude = [ "/bench", "/docs", "/tests", "tests/data/golden_b16ef6f/*.npy" ]
 envs.default.installer = "uv"
 envs.default.dependency-groups = [ "dev" ]
 envs.docs.scripts.build = "sphinx-build -M html docs docs/_build -W {args}"
@@ -136,6 +141,7 @@ lint.ignore = [
   "E501", # line too long -> we accept long comment lines; formatter gets rid of long code lines
   "E731", # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
   "E741", # allow I, O, l as variable names -> I is the identity matrix
+  "F722", # jaxtyping shape strings, e.g. Float[Array, "n G"]
 ]
 lint.per-file-ignores."*/__init__.py" = [ "F401" ]
 lint.per-file-ignores."docs/*" = [ "I" ]
@@ -151,7 +157,12 @@ overrides = [ { module = [ "scipy.*" ], ignore_missing_imports = true } ]
 addopts = [
   "--import-mode=importlib", # allow using test files with same name
 ]
-markers = [ "slow: runs the full pipeline (minutes on a loaded node)" ]
+markers = [
+  "slow: runs the full pipeline (minutes on a loaded node)",
+  "gpu: needs a GPU device; run locally on a free L40S, results go in the PR",
+  "x64: needs JAX_ENABLE_X64=1 (float64 runs of the dtype-generic JAX kernels; the engine itself never needs x64)",
+]
+pythonpath = [ "." ] # tests import bench/ (repo root, not part of the package)
 strict = true
 testpaths = [ "tests" ]
 
