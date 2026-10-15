@@ -6,6 +6,8 @@ ell_n (TH:3383-3392) = 2 x Gaussian log marginal likelihood + (N-1)·G·log(2π)
 their leaf rows are read; ``t[i]`` is the length of the edge above node i (ignored at the root).
 """
 
+from typing import NamedTuple
+
 import numpy as np
 
 from .newick import children_lists
@@ -60,3 +62,46 @@ def _upward(parent, t, x, var):
 def tree_loglik(parent: np.ndarray, t: np.ndarray, x: np.ndarray, var: np.ndarray) -> float:
     """L_tree in the A1 convention (fp64)."""
     return _upward(parent, t, x, var)[0]
+
+
+class TreeGrad(NamedTuple):
+    L: float  # L_tree, A1 convention
+    grad: np.ndarray  # (n,) dL/dt per node's parent edge; 0 at the root
+    x: np.ndarray  # (n, G) downward messages (leaf rows = data)
+    W: np.ndarray  # (n, G) downward precisions (leaf rows = 1/sigma^2)
+    x_ex: np.ndarray  # (n, G) parent's AIR message without this child: x_{\c}; root row = 0
+    W_ex: np.ndarray  # (n, G) W_{\c}; root row = 0
+    x_air: np.ndarray  # (n, G) as-if-root message of every node
+    W_air: np.ndarray  # (n, G)
+
+
+def tree_loglik_grad(parent: np.ndarray, t: np.ndarray, x: np.ndarray, var: np.ndarray) -> TreeGrad:
+    r"""L_tree and dL/dt by the pre-order pass of ``getDerivativesDownstream`` (TH:594-618).
+
+    A unary root raises: the root's own message is its AIR (TH:3414-3430), so its one child's
+    W_{\c} = W_root − w_child is exactly 0 and the gradient is undefined (divide by zero; not a
+    fidelity break, upstream hits the same division).
+    """
+    L, X, V = _upward(parent, t, x, var)
+    order, kids = postorder(parent)
+    root = int(order[-1])
+    if len(kids[root]) == 1:
+        raise ValueError("tree_loglik_grad: a unary root makes the gradient undefined (W_{\\c} = 0)")
+    t = np.asarray(t, dtype=np.float64)
+    W = 1.0 / V
+    n, G = X.shape
+    grad = np.zeros(n)
+    x_ex, W_ex = np.zeros((n, G)), np.zeros((n, G))
+    x_air, W_air = X.copy(), W.copy()  # root AIR = its own message (TH:3414-3430)
+    for p in order[::-1]:  # parents before children
+        for c in kids[p]:
+            w = 1.0 / (t[c] + V[c])
+            Wx = W_air[p] - w  # W_{\c} = W_A − w_c
+            xx = (x_air[p] * W_air[p] - w * X[c]) / Wx
+            T = t[c] + V[c] + 1.0 / Wx
+            grad[c] = np.sum((-1.0 + (xx - X[c]) ** 2 / T) / T)  # der2LeafTree (TH:4927-4930)
+            wt = 1.0 / (t[c] + 1.0 / Wx)
+            W_air[c] = W[c] + wt
+            x_air[c] = (X[c] * W[c] + wt * xx) / W_air[c]
+            x_ex[c], W_ex[c] = xx, Wx
+    return TreeGrad(L, grad, X, W, x_ex, W_ex, x_air, W_air)
