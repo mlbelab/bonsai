@@ -32,7 +32,7 @@ dependencies = [
   "jaxtyping>=0.3.11",
   "matplotlib>=3.8",
   "numpy>=2",
-  "optimistix>=0.1.0,<0.2",  # A9: opt_times reads an optimistix-internal field
+  "optimistix>=0.1,<0.2", # A9: opt_times reads an optimistix-internal field
   "pandas>=2.2",
   "psutil>=5.9",
   "ruamel-yaml>=0.18",
@@ -162,7 +162,7 @@ markers = [
   "gpu: needs a GPU device; run locally on a free L40S, results go in the PR",
   "x64: needs JAX_ENABLE_X64=1 (float64 runs of the dtype-generic JAX kernels; the engine itself never needs x64)",
 ]
-pythonpath = [ "." ] # tests import bench/ (repo root, not part of the package)
+pythonpath = [ "." ]  # tests import bench/ (repo root, not part of the package)
 strict = true
 testpaths = [ "tests" ]
 
