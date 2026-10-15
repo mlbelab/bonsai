@@ -6,6 +6,7 @@
 :hidden: true
 :maxdepth: 1
 
+notebooks/bonsai_tour.ipynb
 api.md
 changelog.md
 contributing.md
