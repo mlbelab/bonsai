@@ -80,6 +80,9 @@ jobs:
           DISPLAY: :42
           JAX_PLATFORMS: cpu
           JAX_ENABLE_X64: "0"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto -m "not gpu and not x64"
 
   # fp64 lane: float64 runs of the dtype-generic JAX kernels (formula checks at eps64 bounds) and the
@@ -95,6 +98,9 @@ jobs:
           MPLBACKEND: agg
           JAX_PLATFORMS: cpu
           JAX_ENABLE_X64: "1"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: uv run --locked pytest -v --color=yes -m "x64 and not gpu"
 
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
