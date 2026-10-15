@@ -53,6 +53,8 @@ class ArrayTree(eqx.Module):
         parent = np.asarray(parent, dtype=np.int64)
         n, G = np.shape(x)
         order, kids = postorder(parent)
+        if len(kids[int(np.flatnonzero(parent < 0)[0])]) == 1:  # as _ref.tree.tree_loglik_grad
+            raise ValueError("a unary root makes the tree gradient undefined (W_{\\c} = 0)")
         is_leaf = np.array([not k for k in kids])
         height = np.zeros(n, dtype=np.int64)
         for v in order:
@@ -82,7 +84,7 @@ class ArrayTree(eqx.Module):
         xl = np.asarray(x, dtype=np.float64)
         centre = xl[is_leaf].mean(axis=0)
         c_hi = centre.astype(np.float32)
-        c_lo = (centre - c_hi).astype(np.float32)
+        c_lo = centre - c_hi  # cast to dtype below: exact pair in float64, rounded once in float32
         x_c = np.where(is_leaf[:, None], xl - centre, 0.0)
         var_c = np.where(is_leaf[:, None], np.asarray(var, dtype=np.float64), 1.0)
         t_c = np.where(parent >= 0, np.asarray(t, dtype=np.float64), 0.0)

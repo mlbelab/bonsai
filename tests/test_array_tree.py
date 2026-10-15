@@ -98,6 +98,30 @@ def test_leaves_are_centred_and_rounded_once():
     np.testing.assert_array_equal(np.asarray(tree.x)[:19][leaf], (x[:10] - centre).astype(np.float32))
 
 
+@pytest.mark.x64
+def test_float64_centre_is_exact():
+    """In float64 the pair hi + lo is the float64 centre exactly (lo = centre − hi is exact, Sterbenz)."""
+    import jax.numpy as jnp
+
+    from bonsai._engine.array_tree import ArrayTree, centre64
+
+    rng = np.random.default_rng(1)
+    parent, t = random_tree(10, rng)
+    x, var = random_leaf_data(parent, 4, rng)
+    x += 30.0
+    tree = ArrayTree.from_arrays(parent, t, x, var, dtype=jnp.float64)
+    np.testing.assert_array_equal(centre64(tree), x[:10].mean(axis=0))
+
+
+def test_unary_root_raises():
+    """As the fp64 reference: a one-child root leaves W_{\\c} = 0 at its child (gradient 0/0)."""
+    from bonsai._engine.array_tree import ArrayTree
+
+    x, var = np.zeros((4, 2)), np.ones((4, 2))
+    with pytest.raises(ValueError, match="unary root"):
+        ArrayTree.from_arrays(np.array([2, 2, 3, -1]), np.full(4, 0.5), x, var)
+
+
 def _golden_config() -> dict:
     """The golden run's own recorded ``zscore_cutoff``/``rescale_by_var`` (`config.yaml`)."""
     cfg = YAML(typ="safe").load((GOLDEN / "config.yaml").read_text())
