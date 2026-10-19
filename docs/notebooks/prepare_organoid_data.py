@@ -1,19 +1,24 @@
-"""Prepare a Sanity input (TSV counts) from the brain-organoid h5ad for the tour notebook.
+r"""Prepare a Sanity input (TSV counts) from an organoid h5ad for the tour notebook.
 
-Subsamples cells stratified by (age, lineage), keeps genes detected in at least ~10 of the
-sampled cells, and writes a tab-separated raw-count matrix that Sanity's ``-f`` flag accepts
-(genes x cells, as required by Sanity's TSV format).
+Subsamples cells stratified by one or more ``obs`` columns (default ``age,lineage``, the brain
+dataset), keeps genes detected in at least ~10 of the sampled cells, and writes a tab-separated
+raw-count matrix that Sanity's ``-f`` flag accepts (genes x cells, as required by Sanity's TSV
+format).
 
-With the defaults (``--n-cells 500`` over the dataset's ~23 non-empty age x lineage strata), each
-stratum requests about 22 cells; small strata are under-filled (fewer than 22 cells with that age
-and lineage), so the total sampled is usually somewhat below ``--n-cells``.
+With the defaults (``--n-cells 500`` over the brain dataset's ~23 non-empty age x lineage strata),
+each stratum requests about 22 cells; small strata are under-filled (fewer than 22 cells with that
+age and lineage), so the total sampled is usually somewhat below ``--n-cells``.
 
 Usage
 -----
     python prepare_organoid_data.py <input.h5ad> <output_dir> [--n-cells 500] [--seed 0]
+    python prepare_organoid_data.py <eec.h5ad> <output_dir> --strata-cols cell_type_initial \\
+        --counts-source X --round
 
 Writes ``<output_dir>/counts.tsv`` and ``<output_dir>/cell_meta.csv`` (the sampled cells' obs
-columns used for notebook plotting).
+columns used for notebook plotting). ``--counts-source X`` reads raw counts from ``.X`` instead of
+``layers["counts"]``; ``--round`` rounds (``np.rint``, clipped at 0) and reports the fraction of
+entries changed, for datasets whose "counts" include fractional multi-mapping splits.
 """
 
 from __future__ import annotations
@@ -34,7 +39,11 @@ def main() -> None:
     p.add_argument("--n-cells", type=int, default=500)
     p.add_argument("--min-cells-per-gene", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--strata-cols", default="age,lineage", help="comma-separated obs columns to stratify on")
+    p.add_argument("--counts-source", choices=["layers:counts", "X"], default="layers:counts")
+    p.add_argument("--round", action="store_true", help="round counts to integers (np.rint, clipped at 0)")
     args = p.parse_args()
+    strata_cols = args.strata_cols.split(",")
 
     rng = np.random.default_rng(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -42,8 +51,8 @@ def main() -> None:
     # Read in backed mode; obs is small, so subset first and only densify the sampled counts.
     a = ad.read_h5ad(args.input_h5ad, backed="r")
 
-    obs = a.obs.dropna(subset=["age", "lineage"]).copy()
-    strata = obs.groupby(["age", "lineage"], observed=True)
+    obs = a.obs.dropna(subset=strata_cols).copy()
+    strata = obs.groupby(strata_cols, observed=True)
     n_strata = strata.ngroups
     per_stratum = max(1, args.n_cells // n_strata)
 
@@ -52,28 +61,49 @@ def main() -> None:
     # two frames' row order.
     picked_names = []
     strata_report = []
-    for (age, lineage), idx in strata.indices.items():
+    for key, idx in strata.indices.items():
+        key = key if isinstance(key, tuple) else (key,)
         k = min(per_stratum, len(idx))
         chosen = rng.choice(idx, size=k, replace=False)
         names = obs.index[chosen]
         picked_names.append(names)
-        strata_report.append((age, lineage, len(idx), k))
+        strata_report.append((*key, len(idx), k))
     picked_names = pd.Index(np.concatenate(picked_names)).unique()
     if len(picked_names) > args.n_cells:
         picked_names = pd.Index(rng.choice(picked_names, size=args.n_cells, replace=False))
 
     sub = a[picked_names].to_memory()
-    assert sub.obs["lineage"].notna().all(), "picked cells must all have a non-NaN lineage"
-    assert sub.obs["age"].notna().all(), "picked cells must all have a non-NaN age"
-    picked_pairs = set(zip(sub.obs["age"], sub.obs["lineage"], strict=True))
-    requested_pairs = {(age, lineage) for age, lineage, _, _ in strata_report}
-    assert picked_pairs <= requested_pairs, "picked (age, lineage) pairs must come from the requested strata"
+    for col in strata_cols:
+        assert sub.obs[col].notna().all(), f"picked cells must all have a non-NaN {col}"
+    picked_pairs = set(zip(*(sub.obs[col] for col in strata_cols), strict=True))
+    requested_pairs = {tuple(row[: len(strata_cols)]) for row in strata_report}
+    assert picked_pairs <= requested_pairs, "picked strata must come from the requested strata"
 
-    print(f"requested ~{per_stratum} cells per stratum across {n_strata} (age, lineage) strata")
-    for age, lineage, available, k in sorted(strata_report):
-        print(f"  age={age}, lineage={lineage}: {k}/{per_stratum} requested ({available} available)")
-    counts = sub.layers["counts"]
+    print(f"requested ~{per_stratum} cells per stratum across {n_strata} {tuple(strata_cols)} strata")
+    for row in sorted(strata_report):
+        *key, available, k = row
+        print(f"  {dict(zip(strata_cols, key, strict=True))}: {k}/{per_stratum} requested ({available} available)")
+    # Real ERCC spike-in probe names only (e.g. "ERCC-00002"); this must not match human genes
+    # that merely start with "ERCC" (ERCC1-8, ERCC6L, ERCC6L2, ERCC8-AS1, BIVM-ERCC5, PERCC1).
+    spike_in = sub.var_names.str.match(r"^ERCC-\d{5}$")
+    if spike_in.any():
+        print(f"dropping {spike_in.sum()} spike-in/ERCC var(s)")
+        sub = sub[:, ~spike_in].copy()
+
+    counts = sub.X if args.counts_source == "X" else sub.layers["counts"]
     counts = np.asarray(counts.todense() if hasattr(counts, "todense") else counts)
+
+    if args.round:
+        rounded = np.clip(np.rint(counts), 0, None)
+        changed = rounded != counts
+        changed_frac_all = np.mean(changed)
+        nonzero = counts != 0
+        changed_frac_nonzero = np.mean(changed[nonzero]) if nonzero.any() else float("nan")
+        print(
+            f"rounding changed {changed_frac_all:.4%} of all count entries "
+            f"({changed_frac_nonzero:.4%} of nonzero entries)"
+        )
+        counts = rounded
 
     detected = (counts > 0).sum(axis=0)
     gene_mask = detected >= args.min_cells_per_gene
