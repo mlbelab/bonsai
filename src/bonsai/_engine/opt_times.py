@@ -5,6 +5,7 @@ from typing import Any, NamedTuple
 
 import equinox as eqx
 import jax.numpy as jnp
+import numpy as np
 import optimistix as optx
 from jaxtyping import Array, Int
 
@@ -14,6 +15,8 @@ from .tree import tree_loglik_grad
 
 LOG_T_MIN, LOG_T_MAX = -15.0, 15.0  # upstream box (TH:3462), t in [3.1e-7, 3.3e6]
 T_SNAP = 2e-6  # upstream sets t < 1e-6 + 1e-6 to exactly 0 after optimising (TH:3467)
+
+_ell = eqx.filter_jit(lambda tree: tree_loglik_grad(tree).ell)  # ell only: XLA drops the n×G messages
 
 
 @eqx.filter_custom_vjp
@@ -112,7 +115,7 @@ def optimise_times(
     """
     s0 = jnp.log(jnp.clip(tree.t, 1e-4, 1e4))
     start = eqx.tree_at(lambda tr: tr.t, tree, jnp.where(tree.parent >= 0, jnp.exp(s0), 0.0))
-    args = (tree, tree_loglik_grad(start).ell)
+    args = (tree, _ell(start))
     sol: optx.Solution = optx.minimise(
         _neg_loglik, _GtolLBFGS(rtol, atol, gtol), s0, args=args, max_steps=max_steps, throw=False
     )
@@ -120,6 +123,5 @@ def optimise_times(
     if snap_zero:
         t = jnp.where(t < T_SNAP, 0.0, t)
     out = eqx.tree_at(lambda tr: tr.t, tree, t)
-    return TimesResult(
-        out, tree_loglik_grad(out).L, sol.stats["num_steps"], bool(sol.result == optx.RESULTS.successful)
-    )
+    L = float(np.sum(np.asarray(_ell(out), dtype=np.float64)))  # as TreeEval.L
+    return TimesResult(out, L, sol.stats["num_steps"], bool(sol.result == optx.RESULTS.successful))

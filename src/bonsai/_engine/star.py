@@ -19,10 +19,11 @@ def child_weights(var, t):
 
 @eqx.filter_jit
 def node_message(x, var, t, mask):
-    """(x_n, W_n) of each star from its children (TH:5257-5294)."""
-    w = jnp.where(mask[..., None], child_weights(var, t), 0.0)
+    """(x_n, W_n) of each star from its children (TH:5257-5294). Padded children may hold any x."""
+    m = mask[..., None]
+    w = jnp.where(m, child_weights(var, t), 0.0)
     W = dsum(w, axis=1)
-    return dsum(w * x, axis=1) / W, W
+    return dsum(jnp.where(m, w * x, 0.0), axis=1) / W, W
 
 
 @eqx.filter_jit

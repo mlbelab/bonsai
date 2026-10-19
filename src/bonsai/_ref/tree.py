@@ -1,4 +1,4 @@
-"""fp64 NumPy reference: Bonsai tree log-likelihood (maths ref §2, §4; the gradient arrives in Task 8).
+"""fp64 NumPy reference: Bonsai tree log-likelihood and gradient (maths ref §2, §4).
 
 Convention (amendment A1): upstream's ``finalLoglik`` units, i.e. the sum over internal nodes of
 ell_n (TH:3383-3392) = 2 x Gaussian log marginal likelihood + (N-1)·G·log(2π), with no

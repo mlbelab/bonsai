@@ -13,14 +13,19 @@ EPS32 = float(np.finfo(np.float32).eps)
 EPS64 = float(np.finfo(np.float64).eps)
 
 
+def heights(parent: np.ndarray) -> np.ndarray:
+    """Per node: edges on the longest path down to a leaf (0 at leaves)."""
+    order, kids = postorder(parent)
+    height = np.zeros(len(parent), dtype=np.int64)
+    for v in order:
+        if kids[v]:
+            height[v] = 1 + max(height[c] for c in kids[v])
+    return height
+
+
 def tree_height(parent: np.ndarray) -> int:
     """Edges on the longest root-to-leaf path."""
-    order, kids = postorder(parent)
-    depth = np.zeros(len(parent), dtype=np.int64)
-    for v in order[::-1]:
-        for c in kids[v]:
-            depth[c] = depth[v] + 1
-    return int(depth.max())
+    return int(heights(parent).max())
 
 
 def loglik_scale(parent: np.ndarray, t: np.ndarray, X: np.ndarray, W: np.ndarray) -> float:
@@ -55,13 +60,10 @@ def tree_tols(parent: np.ndarray, t: np.ndarray, ref, eps: float) -> tuple[float
       grad: the pre-order "outside" messages add up to H more levels, ρ_g = (2H + 1)(C + 3)·eps:
             (1/T + 2d²/T²)·ρ_g + 2|d|·2ρ_g·X/T² + 9·eps·(1/T + d²/T²) per gene.
     """
-    H = tree_height(parent)
-    order, kids = postorder(parent)
+    height = heights(parent)
+    H = int(height.max())
+    kids = postorder(parent)[1]
     C = max(len(k) for k in kids)
-    height = np.zeros(len(parent), dtype=np.int64)
-    for v in order:
-        if kids[v]:
-            height[v] = 1 + max(height[c] for c in kids[v])
     leaves = np.array([not k for k in kids])
     X = np.abs(ref.x[leaves]).max()
     c = np.flatnonzero(parent >= 0)
