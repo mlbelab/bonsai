@@ -13,7 +13,7 @@ import pytest
 
 from bonsai._engine import pair as kernel
 from bonsai._engine.host_acc import ParentAcc
-from bonsai._engine.pair import LM_RISE, LOG_T_MAX, LOG_T_MIN, PG_EPS_FACTOR, pair_score, two_leaf_time
+from bonsai._engine.pair import LM_RISE, PAIR_LOG_T_MAX, PAIR_LOG_T_MIN, PG_EPS_FACTOR, pair_score, two_leaf_time
 from bonsai._engine.star import child_weights
 from bonsai._ref import pair as rp
 from bonsai._ref.star import node_message as ref_message
@@ -88,14 +88,14 @@ def _objective(s: rp.PairScore, mode, eps=EPS64):
             return -ell, -np.array([g[0] - g[1], tt[2] * g[2]]), np.array([sc[0] + sc[1], tt[2] * sc[2]])
 
         u = np.array([s.t[0], np.log(s.t[2])])
-        return snapped(f_seq, u, np.array([0.0, LOG_T_MIN]), np.array([t12, LOG_T_MAX]))
+        return snapped(f_seq, u, np.array([0.0, PAIR_LOG_T_MIN]), np.array([t12, PAIR_LOG_T_MAX]))
 
     def f(u):
         tt = np.exp(u)
         ell, g = star_loglik_grad(xs, vs, tt)
         return -ell, -tt * g, tt * scale(tt)
 
-    return snapped(f, np.log(s.t), np.full(3, LOG_T_MIN), np.full(3, LOG_T_MAX))
+    return snapped(f, np.log(s.t), np.full(3, PAIR_LOG_T_MIN), np.full(3, PAIR_LOG_T_MAX))
 
 
 def _value_scale(s: rp.PairScore, xr, Wr):
@@ -262,7 +262,7 @@ def test_root_coincides_with_ancestor_hits_the_lower_log_t_bound():
     x[2:] = 0.5 * (x[0] + x[1])  # the rest of the parent sits between children 0 and 1
     var[2:] = 1e-3
     out, *_ = _check_pairs(jnp.float32, "joint", x, var, t, [(0, 1)])
-    assert np.log(float(out.t[0, 2])) == pytest.approx(LOG_T_MIN, abs=1e-6)
+    assert np.log(float(out.t[0, 2])) == pytest.approx(PAIR_LOG_T_MIN, abs=1e-6)
 
 
 def _heavy_family(rng, C=202, G=40):
@@ -305,7 +305,7 @@ def test_pair_score_with_two_heavy_children():
 @pytest.mark.parametrize("dtype", [F32, F64])
 @pytest.mark.parametrize("mode", ["sequential", "joint"])
 def test_pair_score_on_all_pairs_of_a_parent(dtype, mode):
-    """Every pair of a 12-child parent (66 pairs), not hand-picked ones (Task 9 lesson): status,
+    """Every pair of a 12-child parent (66 pairs), not hand-picked ones: status,
     value, projected-gradient KKT (check 1 of ``_check_pairs``: at an active bound only an outward
     gradient may exceed the threshold), active set and UB slopes against the reference."""
     x, var, t = _family(np.random.default_rng(8))
@@ -317,7 +317,7 @@ def test_pair_score_on_all_pairs_of_a_parent(dtype, mode):
 # Pairs (rng seed of ``_family``, mode) that missed the convergence test, scored with all 66 pairs
 # of their family in one batch, in earlier solver versions or variants (A11): the fixed Gershgorin
 # shift; LM drafts whose acceptance compared raw |pg| or needed a strict decrease of f (stalls on
-# the tail of a log t heading for LOG_T_MIN); LM without Marquardt's scaling. Rounding under vmap
+# the tail of a log t heading for PAIR_LOG_T_MIN); LM without Marquardt's scaling. Rounding under vmap
 # depends on the batch, so they are rescored in that batch.
 REGRESSION = {
     (100, "joint"): [(2, 3)],
@@ -338,7 +338,7 @@ REGRESSION = {
     (111, "sequential"): [(3, 8)],
     (114, "sequential"): [(2, 4)],
     (118, "sequential"): [(1, 8), (1, 10), (10, 11)],
-    (123, "joint"): [(3, 11)],  # an uncapped r branch climbed 1.7e4·fnoise here (fix round 1)
+    (123, "joint"): [(3, 11)],  # an early LM variant with an uncapped r branch climbed 1.7e4·fnoise here
     (206, "sequential"): [(1, 4)],
     (226, "sequential"): [(1, 2)],
     (227, "sequential"): [(6, 11)],
@@ -359,12 +359,13 @@ MAX_FLAGGED = 3  # of 1,320 pairs per mode (0.25%), declared before the test see
 
 @pytest.mark.slow
 @pytest.mark.parametrize("mode", ["sequential", "joint"])
-def test_convergence_rate_on_fresh_families(mode):
-    """A11: all 66 pairs of 20 fresh 12-child families (seeds 100-119; the iteration budget was
-    chosen on seeds 200-239), each family in one batch as the budget was measured (vmapped float32
-    rounding depends on the batch shape). Flagged pairs (not converged, or a sequential fallback)
-    are at most MAX_FLAGGED and keep a finite last iterate; every other pair meets the reference
-    checks."""
+def test_convergence_rate_on_regression_family_seeds(mode):
+    """A11: all 66 pairs of 20 12-child families already used while tuning the solver (seeds
+    100-119; the iteration budget was chosen on seeds 200-239), each family in one batch as the
+    budget was measured (vmapped float32 rounding depends on the batch shape). Flagged pairs (not
+    converged, or a sequential fallback) are at most MAX_FLAGGED and keep a finite last iterate;
+    every other pair meets the reference checks. Held-out evidence (seeds never used while tuning
+    the solver) is ``test_convergence_rate_on_held_out_seeds`` below."""
     pairs = ALL_PAIRS
     flagged = 0
     for seed in range(100, 120):
@@ -374,10 +375,25 @@ def test_convergence_rate_on_fresh_families(mode):
     assert flagged <= MAX_FLAGGED
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("mode", ["sequential", "joint"])
+def test_convergence_rate_on_held_out_seeds(mode):
+    """A11 held-out check: all 66 pairs of 20 12-child families on seeds 300-319, never used while
+    tuning the solver (``N_NEWTON``, ``LM_RISE``) or choosing ``MAX_FLAGGED``. Same family generator
+    and pre-declared bound as ``test_convergence_rate_on_regression_family_seeds``; run once."""
+    pairs = ALL_PAIRS
+    flagged = 0
+    for seed in range(300, 320):
+        x, var, t = _family(np.random.default_rng(seed))
+        kw = {"max_flagged": len(pairs), "batch": pairs}
+        flagged += _check_pairs(jnp.float32, mode, x, var, t, pairs, **kw)[1]
+    assert flagged <= MAX_FLAGGED
+
+
 @pytest.mark.parametrize("mode", ["sequential", "joint"])
 def test_no_accepted_step_raises_f_beyond_the_cap(mode):
     """A step accepted for a smaller relative projected gradient may raise f by at most
-    LM_RISE·fnoise (fix round 1: without the cap the solver jumped uphill to a worse all-bound KKT
+    LM_RISE·fnoise (without the cap an earlier LM variant jumped uphill to a worse all-bound KKT
     point, by up to 1.7e4·fnoise; this family had such jumps in both modes). Whole family, one batch."""
     x, var, t = _family(np.random.default_rng(102))
     c = lambda a: jnp.asarray(a, jnp.float32)
@@ -450,7 +466,7 @@ def test_unconverged_pair_is_flagged_not_dropped():
 
 
 def test_two_child_parent_is_rejected_through_the_accumulator():
-    """Task 9 carry-over: for a 2-child parent W − w_1 − w_2 from the float32 weights is rounding
+    """For a 2-child parent W − w_1 − w_2 from the float32 weights is rounding
     noise, which a threshold on W cannot certify; ``rest`` raises on the child count, which add and
     remove keep."""
     x, var, t = _family(np.random.default_rng(7), C=3)

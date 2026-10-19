@@ -13,7 +13,7 @@ from scipy.optimize import brentq, minimize
 
 from .star import node_message, star_loglik_grad, two_leaf_dlogl  # two_leaf_dlogl re-exported
 
-LOG_T_MIN, LOG_T_MAX = -16.1180, 10.0  # TH:4826, 4864 (t in [1.0e-7, 2.2e4])
+PAIR_LOG_T_MIN, PAIR_LOG_T_MAX = -16.1180, 10.0  # TH:4824, 4864 (t in [1.0e-7, 2.2e4])
 EPS64 = float(np.finfo(np.float64).eps)
 # Reference stopping rule: every free coordinate has |g_i| <= (KKT_EPS_FACTOR + G)·eps64·Σ_g|terms of g_i|
 # (``_scales``), i.e. its gradient is zero to what fp64 resolves: <= 8 rounded ops per gene term, +1 for
@@ -38,7 +38,7 @@ def two_leaf_time(x1, v1, x2, v2) -> tuple[float | None, bool]:
 
 
 def init_times(t1: float, t2: float) -> tuple[list[float], list[float]]:
-    """CalcTInit (HE:787-793): (sequential [t12, tau], joint [t1 − tau, t2 − tau, tau]), tau = min/2."""
+    """CalcTInit (HE:788-794): (sequential [t12, tau], joint [t1 − tau, t2 − tau, tau]), tau = min/2."""
     tau = min(t1, t2) / 2
     return [t1 + t2 - 2 * tau, tau], [t1 - tau, t2 - tau, tau]
 
@@ -124,7 +124,7 @@ def pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode: str = "sequential") -> Pair
             u, ok = _minimise_box(
                 lambda u, sc=False: seq_objective(u, t12, xs, vs, sc),
                 [0.5 * t12, np.log(max(seq0[1], 1e-4))],
-                [(0.0, t12), (LOG_T_MIN, LOG_T_MAX)],
+                [(0.0, t12), (PAIR_LOG_T_MIN, PAIR_LOG_T_MAX)],
                 rtol,
             )
             times = np.array([u[0], t12 - u[0], np.exp(u[1])])
@@ -134,7 +134,7 @@ def pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode: str = "sequential") -> Pair
         s, ok = _minimise_box(
             lambda s, sc=False: joint_objective(s, xs, vs, sc),
             np.log(np.maximum(joint0, 1e-4)),
-            [(LOG_T_MIN, LOG_T_MAX)] * 3,
+            [(PAIR_LOG_T_MIN, PAIR_LOG_T_MAX)] * 3,
             rtol,
         )
         times = np.exp(s)
@@ -162,7 +162,7 @@ def _polish(f, u, lo, hi, rtol, iters: int = 20):
     """Projected Newton on the free coordinates with a forward-FD Hessian of the analytic gradient.
 
     L-BFGS-B stops where f's decreases fall below its rounding (ftol), which can leave a gradient
-    far above its own rounding, and it crawls along a log t tail heading for LOG_T_MIN (gradient
+    far above its own rounding, and it crawls along a log t tail heading for PAIR_LOG_T_MIN (gradient
     and curvature ∝ t). The gradient stays resolved there, so a step is kept when it lowers r
     without raising f beyond the rounding of two evaluations, 2·rtol·fscale.
     """

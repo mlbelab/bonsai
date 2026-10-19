@@ -6,8 +6,8 @@ from bonsai._core.helpers import calcTInit
 from bonsai._ref import pair as ref_pair
 from bonsai._ref.pair import (
     KKT_EPS_FACTOR,
-    LOG_T_MAX,
-    LOG_T_MIN,
+    PAIR_LOG_T_MAX,
+    PAIR_LOG_T_MIN,
     init_times,
     joint_objective,
     pair_score,
@@ -86,11 +86,11 @@ def test_reference_optimum_satisfies_kkt_by_finite_differences(mode):
         assert abs(t12 - two_leaf_time(x[2], var[2], x[3], var[3])[0]) <= 2 * EPS64 * t12
         u = np.array([s.t[0], np.log(s.t[2])])
         f = lambda uu: ell(np.array([uu[0], t12 - uu[0], np.exp(uu[1])]))
-        lo, hi = np.array([0.0, LOG_T_MIN]), np.array([t12, LOG_T_MAX])
+        lo, hi = np.array([0.0, PAIR_LOG_T_MIN]), np.array([t12, PAIR_LOG_T_MAX])
     else:
         u = np.log(s.t)
         f = lambda uu: ell(np.exp(uu))
-        lo, hi = np.full(3, LOG_T_MIN), np.full(3, LOG_T_MAX)
+        lo, hi = np.full(3, PAIR_LOG_T_MIN), np.full(3, PAIR_LOG_T_MAX)
     scale = 3 * abs(f(u)) + s.xs.size
     obj = (lambda uu: seq_objective(uu, t12, s.xs, s.vs, True)) if mode == "sequential" else None
     obj = obj or (lambda uu: joint_objective(uu, s.xs, s.vs, True))
@@ -156,7 +156,7 @@ def _task12_family(seed):
 
 # Sequential solves where the old absolute stop, 1e-8·(1 + |f|), fell back to joint although upstream
 # stayed sequential (L-BFGS-B ends by ftol with |g| ~ 1e-6 above that threshold), or stopped short on
-# a log t_aR tail at −15.95 … −16.06 instead of LOG_T_MIN (Task 12 report, Concern 1).
+# a log t_aR tail at −15.95 … −16.06 instead of PAIR_LOG_T_MIN.
 SPURIOUS_FALLBACKS = [(100, 0, 10), (106, 1, 2), (109, 6, 7), (111, 7, 8), (115, 2, 6)]
 FLAT_TAILS = [(101, 6, 9), (106, 0, 8), (112, 1, 8), (113, 0, 3)]
 
@@ -165,12 +165,12 @@ FLAT_TAILS = [(101, 6, 9), (106, 0, 8), (112, 1, 8), (113, 0, 3)]
 def test_sequential_stays_sequential_and_matches_upstream(seed, i, j):
     """The resolution-scaled stop accepts the optimum fp64 resolves: no fallback, agreement with
     upstream. On a flat tail the gradient is ∝ t but resolved (r = |g|/gscale is O(1)), so the
-    solve continues to the bound: log t_aR = LOG_T_MIN with an outward gradient."""
+    solve continues to the bound: log t_aR = PAIR_LOG_T_MIN with an outward gradient."""
     x, var, t, xr, Wr = _task12_family(seed)
     s = _check_matches_upstream(x, var, t, xr, Wr, i, j)
     if (seed, i, j) in FLAT_TAILS:
         u = np.array([s.t[0], np.log(s.t[2])])
-        assert u[1] == LOG_T_MIN and seq_objective(u, s.t[0] + s.t[1], s.xs, s.vs)[1][1] > 0
+        assert u[1] == PAIR_LOG_T_MIN and seq_objective(u, s.t[0] + s.t[1], s.xs, s.vs)[1][1] > 0
 
 
 def test_ub_slopes_match_upstream_and_finite_differences():
@@ -242,7 +242,7 @@ def test_sequential_falls_back_to_joint_when_t12_bracket_fails():
 
 def test_sequential_active_bounds_match_upstream():
     """Child 2 sits at R (x_2 = x_R, W_R large) ⇒ a collapses onto 2: t_1a hits its upper bound t_12 (t_2a = 0
-    exactly) and t_aR its lower bound. KKT signs by the analytic gradient (FD-checked in Task 8): ∂ell/∂t_1a =
+    exactly) and t_aR its lower bound. KKT signs by the analytic gradient (FD-checked above): ∂ell/∂t_1a =
     g_1 − g_2 ≥ 0 at the upper bound, ∂ell/∂log t_aR ≤ 0 at the lower bound. Upstream (tol=1e-9) stops at the
     same vertex, so the values agree to the rounding of two evaluations, 16·eps64·Σ|terms|."""
     from bonsai._ref.star import star_loglik_grad
@@ -257,7 +257,7 @@ def test_sequential_active_bounds_match_upstream():
     xr = (WR * x2 + w1 * x1 + w2 * x2) / Wr
     s = pair_score(x1, v1, t1, x2, v2, t2, xr, Wr)
     assert s.converged
-    assert s.t[1] == 0.0 and np.log(s.t[2]) == pytest.approx(LOG_T_MIN, abs=EPS64 * abs(LOG_T_MIN))
+    assert s.t[1] == 0.0 and np.log(s.t[2]) == pytest.approx(PAIR_LOG_T_MIN, abs=EPS64 * abs(PAIR_LOG_T_MIN))
     g = star_loglik_grad(s.xs, s.vs, s.t)[1]
     assert g[0] - g[1] >= 0 and s.t[2] * g[2] <= 0
     up_dl, up_t = th.calcSingleDLogL(xr, Wr, x1, v1, w1, t1, Wr - w1, xr * Wr - w1 * x1, x2, v2, w2, t2, tol=1e-9)
@@ -326,22 +326,22 @@ def test_all_pairs_converge_with_kkt_signs_and_joint_dominates_interior():
                 args = (x[i], var[i], t[i], x[j], var[j], t[j], xr, Wr)
                 sq, jt = pair_score(*args), pair_score(*args, mode="joint")
                 assert sq.converged and jt.converged, (seed, i, j)
-                # joint: s = log t in [LOG_T_MIN, LOG_T_MAX]^3
+                # joint: s = log t in [PAIR_LOG_T_MIN, PAIR_LOG_T_MAX]^3
                 sj = np.log(jt.t)
                 fj, gj, _, gsj = joint_objective(sj, jt.xs, jt.vs, True)
                 kkt = (KKT_EPS_FACTOR + x.shape[1]) * EPS64 * gsj
-                assert np.all(gj[sj <= LOG_T_MIN] >= -kkt[sj <= LOG_T_MIN]) and np.all(
-                    gj[sj >= LOG_T_MAX] <= kkt[sj >= LOG_T_MAX]
+                assert np.all(gj[sj <= PAIR_LOG_T_MIN] >= -kkt[sj <= PAIR_LOG_T_MIN]) and np.all(
+                    gj[sj >= PAIR_LOG_T_MAX] <= kkt[sj >= PAIR_LOG_T_MAX]
                 )
                 # sequential: u = (t_1a in [0, t12], log t_aR in the box)
                 t12 = sq.t[0] + sq.t[1]
                 u = np.array([sq.t[0], np.log(sq.t[2])])
                 fs, gs, _, gss_ = seq_objective(u, t12, sq.xs, sq.vs, True)
                 kkt = (KKT_EPS_FACTOR + x.shape[1]) * EPS64 * gss_
-                lo, hi = np.array([0.0, LOG_T_MIN]), np.array([t12, LOG_T_MAX])
+                lo, hi = np.array([0.0, PAIR_LOG_T_MIN]), np.array([t12, PAIR_LOG_T_MAX])
                 assert np.all(gs[u <= lo] >= -kkt[u <= lo]) and np.all(gs[u >= hi] <= kkt[u >= hi])
                 ss = np.log(sq.t)
-                inside = lambda z: np.all((z > LOG_T_MIN) & (z < LOG_T_MAX))
+                inside = lambda z: np.all((z > PAIR_LOG_T_MIN) & (z < PAIR_LOG_T_MAX))
                 if inside(ss) and inside(sj):
                     n_interior += 1
                     ds = ss - sj

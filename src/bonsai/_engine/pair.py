@@ -17,13 +17,14 @@ from jax import lax
 from jax.scipy.linalg import cho_solve
 from jaxtyping import Array, Bool, Float
 
+from bonsai._ref.pair import PAIR_LOG_T_MAX, PAIR_LOG_T_MIN
+
 from .numerics import dsum
 
-LOG_T_MIN, LOG_T_MAX = -16.1180, 10.0  # TH:4826, 4864
 N_BRACKET = 8  # upper brackets 1, 10, ..., 1e7: upstream gives up once lb > 1e6 (TH:4915)
 N_ROOT = 64  # safeguarded Newton/bisection steps: 1e7·2^-64 < eps32·1e-5
-# LM iterations (A11): on 40 fresh 12-child families (2,640 pairs per mode, disjoint from the test
-# seeds) 40 iterations left none unconverged in either mode; 60 keeps a 1.5× margin
+# LM iterations (A11): on 40 12-child families from seeds 200-239 (2,640 pairs per mode, disjoint
+# from the test seeds) 40 iterations left none unconverged in either mode; 60 keeps a 1.5× margin
 N_NEWTON, N_HALVINGS = 60, 40
 LM_LAMBDA0 = 1e-3  # initial damping, relative to each coordinate's curvature |H_ii| (A11)
 LM_UP, LM_DOWN = 10.0, 3.0  # damping × LM_UP on a rejected step, / LM_DOWN on an accepted one
@@ -31,8 +32,9 @@ LM_UP, LM_DOWN = 10.0, 3.0  # damping × LM_UP on a rejected step, / LM_DOWN on 
 # LM_RISE·fnoise. Two evaluations of f differ by up to 2·fnoise from rounding alone, and fnoise is a
 # first-order worst case (the observed rounding is 10-100× smaller), so 10·fnoise still lets the
 # solver cross ulp-level noise near the optimum and on a log t tail; a real uphill move, e.g. a jump
-# to a worse point where every coordinate is on a bound (r = 0 there), is rejected. Without the cap
-# such rises reached 1.7e4·fnoise. With 10: 0 unconverged, 0 fallbacks on rng 100-119 and 200-239.
+# to a worse point where every coordinate is on a bound (r = 0 there), is accepted only if its rise
+# is ≤ LM_RISE·fnoise, otherwise rejected. Without the cap such rises reached 1.7e4·fnoise. With 10: 0 unconverged,
+# 0 fallbacks on rng 100-119 and 200-239.
 LM_RISE = 10.0
 # converged iff |projected grad| ≤ (PG_EPS_FACTOR + G)·eps·Σ_g|grad terms|: 8 rounded ops per term
 # × 8 slack, plus (G − 1)·eps for the plain (autodiff) float32 sum over genes in the gradient
@@ -196,8 +198,8 @@ def _one(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode, diag=False):
     tau = jnp.minimum(t1, t2) / 2
     joint0 = jnp.stack([t1 - tau, t2 - tau, tau])
 
-    # joint (A2) / sequential fallback (TH:4822-4831): log t of all three in [LOG_T_MIN, LOG_T_MAX]
-    lo3, hi3 = jnp.full(3, LOG_T_MIN, dt), jnp.full(3, LOG_T_MAX, dt)
+    # joint (A2) / sequential fallback (TH:4822-4831): log t of all three in [PAIR_LOG_T_MIN, PAIR_LOG_T_MAX]
+    lo3, hi3 = jnp.full(3, PAIR_LOG_T_MIN, dt), jnp.full(3, PAIR_LOG_T_MAX, dt)
     tiny = jnp.finfo(dt).tiny
 
     def joint_scale(s):  # Σ_g |terms of dell/dlog t_c|
@@ -221,8 +223,8 @@ def _one(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode, diag=False):
             return jnp.stack([u[0], t12 - u[0], jnp.exp(u[1])])
 
         lo2, hi2 = (
-            jnp.stack([jnp.zeros((), dt), jnp.asarray(LOG_T_MIN, dt)]),
-            jnp.stack([t12, jnp.asarray(LOG_T_MAX, dt)]),
+            jnp.stack([jnp.zeros((), dt), jnp.asarray(PAIR_LOG_T_MIN, dt)]),
+            jnp.stack([t12, jnp.asarray(PAIR_LOG_T_MAX, dt)]),
         )
         u0 = jnp.stack([0.5 * t12, jnp.log(jnp.maximum(tau, 1e-4))])
 
@@ -249,15 +251,15 @@ def _one(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode, diag=False):
         return rise_j, rise_s
     ell_new, _ = _per_gene_ell(times, xs, vs)
     # old term: the parent with children (1, 2, R) at weights (w_1, w_2, W_R) and the given (xr, Wr) (TH:5400-5402)
-    xr_, WR_, Wr_ = xr, 1.0 / vR, Wr
+    WR_ = 1.0 / vR
     ell_old = (
         jnp.log(w1)
         + jnp.log(w2)
         + jnp.log(WR_)
-        - jnp.log(Wr_)
-        - w1 * (xr_ - x1) ** 2
-        - w2 * (xr_ - x2) ** 2
-        - WR_ * (xr_ - xs[2]) ** 2
+        - jnp.log(Wr)
+        - w1 * (xr - x1) ** 2
+        - w2 * (xr - x2) ** 2
+        - WR_ * (xr - xs[2]) ** 2
     )
     dlogl = dsum(ell_new - ell_old)  # per-gene difference first
 
@@ -265,7 +267,7 @@ def _one(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode, diag=False):
     wa = 1.0 / (vs + times[:, None])
     w1a, w2a, wRa = wa
     rho_a = wRa / wa.sum(axis=0)
-    rho_r = WR_ / Wr_
+    rho_r = WR_ / Wr
     xx1, xx2, xxR = xs
     v12, v1R, v2R = (xx1 - xx2) ** 2, (xx1 - xxR) ** 2, (xx2 - xxR) ** 2
     da = w1a * w2a * v12 + w1a * wRa * v1R + w2a * wRa * v2R
@@ -275,12 +277,12 @@ def _one(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode, diag=False):
         - WR_ * (1 - rho_r)
         + rho_a * (w1a * w2a * v12 - (1 - rho_a) * da)
         - rho_r * (w1 * w2 * v12 - (1 - rho_r) * dr)
-    ) / WR_**2 + (2 * (xr_ - xxR) / WR_) * (
+    ) / WR_**2 + (2 * (xr - xxR) / WR_) * (
         rho_a * (w1a * (xx1 - xxR) + w2a * (xx2 - xxR)) - rho_r * (w1 * (xx1 - xxR) + w2 * (xx2 - xxR))
     )
-    dx = 2 * (Wr_ / WR_) * ((xx1 - xxR) * (w1a * rho_a - w1 * rho_r) + (xx2 - xxR) * (w2a * rho_a - w2 * rho_r))
-    a = jnp.sqrt(dsum(dx * dx / Wr_))
-    b = jnp.sqrt(dsum((dW * Wr_) ** 2))
+    dx = 2 * (Wr / WR_) * ((xx1 - xxR) * (w1a * rho_a - w1 * rho_r) + (xx2 - xxR) * (w2a * rho_a - w2 * rho_r))
+    a = jnp.sqrt(dsum(dx * dx / Wr))
+    b = jnp.sqrt(dsum((dW * Wr) ** 2))
     return PairScore(dlogl, times, a, b, ok, fallback)
 
 
@@ -298,7 +300,7 @@ def pair_score(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, mode: str = "sequential")
     back to it where the reference does: t_12 has no bracket, or the sequential solve misses its own
     convergence test (projected gradient; upstream uses scipy's ``success`` flag) while the joint one
     passes. ``mode`` (static): "sequential" reproduces upstream (t_12 from the 2-leaf problem, then
-    (t_1a, log t_aR) on [0, t_12] × [LOG_T_MIN, LOG_T_MAX], joint fallback); "joint" optimises
+    (t_1a, log t_aR) on [0, t_12] × [PAIR_LOG_T_MIN, PAIR_LOG_T_MAX], joint fallback); "joint" optimises
     (log t_1a, log t_2a, log t_aR) together (A2).
 
     Status (A11): ``converged`` says whether the returned times passed their solve's convergence
