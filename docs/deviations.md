@@ -160,3 +160,22 @@
   the sequential solve's iterate flagged not converged, so a later host re-score can still use it;
   upstream's pair score in that situation is `-inf` and the pair is treated as having no finite
   value.
+- Block-scheduled tree pass (A14): the device tree pass no longer pads every tree level to the
+  widest level, which scheduled 9–19× the useful rows on the trees measured (8,000-leaf random
+  tree; two real trees of 772 and 1,194 nodes). The host now builds a schedule of blocks of static
+  width B = min(256, bucketed n), ordered by level (post-order levels for the up pass, reversed for
+  the down pass); each block holds at most B nodes of a single level, padded and masked, so a pass
+  costs about (n + levels·B)·G rows. Sibling groups that span blocks are completed with carried and
+  per-block tail partial sums, so every message is still formed by sums only, without subtraction.
+  The compile key is (B, bucketed n, bucketed number of leaves, bucketed block count, G),
+  independent of the tree's shape. The leaf data are stored once per leaf, (bucketed number of
+  leaves, G), with a node-to-row index, instead of one row per node. The maths, the objective and
+  every decision rule are unchanged: the existing agreement tests against the fp64 reference, the
+  golden tree and the x64 checks pass at their unchanged, derived tolerances. Measured:
+  scheduled/useful rows per pass 1.33/1.26 (up/down) on the 8,000-leaf tree, 1.04/1.03 on a
+  100,000-leaf random tree, but 9–10 on the two real trees measured, and up to ~29 on deeper real
+  trees of similar size, where the number of levels times B dominates. Memory, from CPU
+  `memory_analysis` at 10,000 leaves × 2,000 genes, in units of one padded-nodes × genes float32
+  array: tree pass 10.3 → 6.1, times-optimiser objective 9.3 → 6.0. Indicative GPU timing (one
+  L40S, not a benchmark): tree pass 85 → 27 ms at 10,000 leaves and 1,952 → 217–228 ms at
+  100,000 leaves, peak memory 20.9 → 14.8 GB at 100,000 leaves.
