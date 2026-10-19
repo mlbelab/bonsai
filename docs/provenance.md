@@ -13,3 +13,19 @@
 - Phase 2 (2026-10): `tests/conftest.py` precision guard, `bench/metadata.py` and
   `bench.run.count_compilations` reproduce the behaviour of helpers in the internal mlbelab project rose
   (`tests/conftest.py`, `bench/metadata.py`, `rose/core/compile_count.py`); no licence constraint (internal).
+- `bonsai._ref.preprocess`: a vectorised float64 NumPy port of upstream's `read_and_filter`
+  (`_core/dataprocessing.py` DP:2792-3135) and the `√geneVariances` rescaling in `SCData.__init__`
+  (DP:204-230), reproducing both bitwise on the kept fixtures.
+- `bonsai._ref.{star,pair,tree}` and `bonsai._engine.*`: re-implementations, in NumPy (fp64
+  reference) and JAX (device kernels), of upstream b16ef6f's node-message, star-EM, 3-leaf pair and
+  whole-tree log-likelihood formulas, licence CC BY-NC 4.0. Upstream's own code is not copied; each
+  formula is cited inline to its upstream source lines, e.g. `_core/tree_helpers.py` (`TH:`) for
+  node messages (`findNodeLtqsGivenLeafs`, TH:5257-5294), the star log-likelihood and gradient
+  (`getLoglikAndGradStarTree`, TH:5063-5115), and the pair solvers and box
+  (`calcSingleDLogL` and related, TH:4822-4923, TH:5166-5226, TH:5362-5408); `_core/helpers.py`
+  (`HE:`) for `calcTInit` (HE:788-794); and `_core/dataprocessing.py` (`DP:`) for preprocessing
+  (above).
+- `MATMUL_PRECISION` (`src/bonsai/_engine/numerics.py`): the explicit-precision matmul pattern
+  (passing `precision=jax.lax.Precision.HIGHEST` so float32 matmuls do not lower to TF32 on GPU) is
+  the one used by the internal mlbelab project rose (`rose.core.numerics`); no licence constraint
+  (internal).

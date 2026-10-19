@@ -57,6 +57,6 @@ def test_dsum_error_bound_on_many_terms():
 
 @pytest.mark.x64
 def test_float32_stays_float32_with_x64_enabled():
-    """float32 input stays float32 when another library set JAX_ENABLE_X64=1 (see also Task 11)."""
+    """float32 input stays float32 when another library set JAX_ENABLE_X64=1."""
     a = jnp.asarray([1e8, 1.0, -1e8, 1.0], jnp.float32)
     assert dsum(a).dtype == jnp.float32 and float(dsum(a)) == 2.0

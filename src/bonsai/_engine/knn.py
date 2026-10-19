@@ -16,10 +16,10 @@ def knn_coords(x, W, t, xp, Wp) -> np.ndarray:
     Each child's as-if-root message with t ← max(t, 1e-4) (getLtqsAsIfRoot_vectorized, TH:5335-5349,
     no 1e-12 guard), minus the parent's AIR mean, scaled to unit L2 norm per child (squared
     Euclidean = 2 − 2·cosine). x, W: (C, G) children; t: (C,); xp, Wp: (G,) the parent's AIR
-    message (from ``ParentAcc``). Host float64 (A8): W_p − w̄_c cancels when one child dominates.
+    message (from ``ParentAcc``). Host float64: W_p − w̄_c cancels when one child dominates.
     Computed once per index rebuild; cast the result to float32 for ``knn``. A child whose vector
     is exactly zero stays zero (upstream divides 0/0 here and then crashes on sklearn's NaN check,
-    TH:2133-2134; spec amendment A13).
+    TH:2136-2137; see docs/deviations.md).
     """
     x, W = np.asarray(x, dtype=np.float64), np.asarray(W, dtype=np.float64)
     tt = np.maximum(np.asarray(t, dtype=np.float64), MIN_TIME)[:, None]
@@ -36,8 +36,9 @@ def knn_coords(x, W, t, xp, Wp) -> np.ndarray:
 def knn(points, k: int, block: int = 1024):
     """Indices (C, k) of each point's k nearest other points by squared Euclidean distance.
 
-    Exact: every query block is compared with all points in one matmul (explicit HIGHEST
-    precision, no TF32). Self-matches are excluded; ties keep the lower index first (lax.top_k).
+    Exact up to fp32 distance rounding: every query block is compared with all points in one
+    matmul (explicit HIGHEST precision, no TF32). Self-matches are excluded; ties keep the lower
+    index first (lax.top_k).
     """
     C = points.shape[0]
     if not 0 < k < C:

@@ -1,4 +1,4 @@
-"""Exact kNN in upstream's metric (maths ref §8): float32 device search, float64 host coordinates (A8)."""
+"""Exact kNN in upstream's metric: float32 device search, float64 host coordinates."""
 
 import jax
 import jax.numpy as jnp
@@ -57,6 +57,13 @@ def test_knn_nonunit_rows_needs_column_norm_term():
     scale[:5] = 0.0  # exact zero rows
     P *= scale[:, None]
     _check_knn(P, 10, 64)
+
+
+def test_knn_smallest_valid_case_c2_k1():
+    """C=2, k=1: the only valid neighbour of each point is the other point."""
+    P = jnp.asarray(_unit(np.random.default_rng(7), 2, 5), jnp.float32)
+    idx = np.asarray(knn(P, 1, block=4))
+    assert idx.tolist() == [[1], [0]]
 
 
 def test_duplicate_points_tie_break_by_lower_index():

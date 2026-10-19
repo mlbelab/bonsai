@@ -1,9 +1,8 @@
-"""Precision policy of the JAX engine (spec §1 "Precision", amendment A8).
+"""Precision policy of the JAX engine.
 
 Device kernels run in the dtype of their inputs (float32 by default) in the default, x64-off
 process. Long accumulations that must be float64 (a parent's Σw and Σw·x over many children, the
-total log-likelihood) live on the host as float64 NumPy arrays (arriving in Task 12). Reductions
-over genes or children on the device use :func:`dsum`, a compensated (double-float) pairwise sum,
+total log-likelihood) live on the host as float64 NumPy arrays. Reductions over genes or children on the device use :func:`dsum`, a compensated (double-float) pairwise sum,
 so their error does not grow with the number of terms. Matmuls pass ``precision=MATMUL_PRECISION``:
 JAX lowers float32 matmuls to TF32 on GPUs by default, which is not float32 (pattern from rose
 ``rose.core.numerics``, internal).

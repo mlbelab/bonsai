@@ -116,3 +116,47 @@
   x2 = 2e5, v = 0.1, G = 4), never for normalised data.
 - `pair_score` raises `ValueError` when the parent has no third child, i.e. W_r − w_1 − w_2 ≤ 4·eps·W_r.
   Upstream would continue with W_R ≈ 0 and produce NaN or inf.
+
+## Phase 2 `_engine` deviations (device kernels)
+- Pair-solver convergence and fallback (A11): upstream's sequential 3-leaf solve falls back to the
+  joint solve when scipy reports `success=False` at its own loose tolerance (`_core/tree_helpers.py`
+  TH:4867, TH:5382-5386). The device solver instead runs a fixed number of damped-Newton iterations
+  and decides convergence from a resolution-scaled projected-gradient (KKT) test on the result,
+  never from a solver status flag. Damping is adaptive Levenberg–Marquardt (λ·|diag H|, growing on
+  a rejected step, shrinking on an accepted one, capped by a Gershgorin bound), replacing a fixed
+  Gershgorin shift that missed its own convergence test on 0.5–0.8% of pairs because the shift was
+  15–50× too large in flat valleys. A step is accepted if the objective does not rise beyond its
+  derived rounding bound, or if the relative projected gradient drops while the objective rises by
+  at most a small, derived multiple of that bound (a strict-decrease rule stalls in float32; an
+  r-only rule, tried first, let the solver accept an uphill jump to a worse KKT point). Any pair
+  that still fails its convergence test after the fixed iteration budget is returned with an
+  explicit not-converged flag, never silently as a fallback or an unconverged value treated as
+  final; every flagged pair must be re-scored on the host with the fp64 reference before any merge
+  decision uses it.
+- Box handling in the device branch-length optimiser (A12): upstream's L-BFGS-B clips the iterate
+  into its box and reports convergence once the clipped gradient's zero-slope rule fires. Clipping
+  the iterate was tried for the device optimiser and rejected because it stalls L-BFGS; the device
+  optimiser instead keeps the gradient component that still points back into the box at a clipped
+  point (scipy's own projected-gradient, "pgtol", semantics) and only reports convergence there, or
+  when the optimiser's own small-step/small-change (Cauchy) rule fires (next entry). A plain
+  zero-slope rule at the box boundary was tried first and reported convergence at non-KKT points,
+  where a further step would have moved the objective by a large, easily-measured amount.
+- The float32 branch-length optimiser cannot reach upstream's default gradient tolerance (1e-6):
+  the objective's own float32 resolution is reached first, and optimistix's small-step/small-change
+  stopping rule (not the gradient-tolerance rule) fires at that point instead.
+- A child whose posterior position exactly equals its parent's as-if-root mean has no direction to
+  report (a 0/0 division, `_core/tree_helpers.py` TH:2136-2137): upstream's NumPy array crashes
+  when the result (a NaN) reaches the nearest-neighbour library's input check. The device-kNN
+  coordinate function returns the zero vector for that child instead (distance 1 to every unit
+  vector, 0 to another zero vector), avoiding the crash without changing any other child's result
+  (A13).
+- The pair solver scores each 3-leaf subproblem to its solver's own convergence tolerance (near the
+  true optimum, to float32/float64 resolution), where upstream scores it to a fixed tolerance
+  (1e-4) during candidate search (TH:1303). Because the search is otherwise a free choice
+  among positive-gain pairs, the engine's score for a given pair is typically at least upstream's
+  score for the same pair (up to rounding, when both reach the same optimum), so it can pick a
+  different, higher-scoring pair and so a different merge order than upstream on the same data.
+- When neither the sequential nor the joint 3-leaf solve converges for a pair, the engine returns
+  the sequential solve's iterate flagged not converged, so a later host re-score can still use it;
+  upstream's pair score in that situation is `-inf` and the pair is treated as having no finite
+  value.
