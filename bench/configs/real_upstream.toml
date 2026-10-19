@@ -1,0 +1,13 @@
+# Real-dataset hook: pass the data with --data-path (an .h5ad with the bonsai_* slots from
+# bonsai.pp.read_sanity / pp.from_arrays, or a Sanity output folder). No ground truth, so no
+# quartet/RF metrics.
+[run]
+name = "real_upstream"
+seed = 0
+backend = "upstream"
+n_warm = 0
+
+[data]
+kind = "real"
+
+[upstream]

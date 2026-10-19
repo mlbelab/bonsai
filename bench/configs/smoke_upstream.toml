@@ -1,0 +1,15 @@
+# Seconds-to-minutes smoke run of the upstream backend on a tiny simulated dataset.
+[run]
+name = "smoke_upstream"
+seed = 0
+backend = "upstream"
+n_warm = 0
+
+[data]
+kind = "simulate"
+n_cells = 24
+n_genes = 60
+
+[upstream]
+nnn_n_randommoves = 10
+nnn_n_randomtrees = 2

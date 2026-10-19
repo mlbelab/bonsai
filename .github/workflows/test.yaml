@@ -78,7 +78,25 @@ jobs:
           MPLBACKEND: agg
           PLATFORM: ${{ matrix.os }}
           DISPLAY: :42
-        run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto
+          JAX_PLATFORMS: cpu
+          JAX_ENABLE_X64: "0"
+        run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto -m "not gpu and not x64"
+
+  # fp64 lane: float64 runs of the dtype-generic JAX kernels (formula checks at eps64 bounds) and the
+  # float32-under-x64 dtype test, in their own process (x64 is never toggled in-process).
+  fp64:
+    name: CPU fp64 lane (JAX_ENABLE_X64=1, -m x64)
+    runs-on: ubuntu-latest
+    steps:
+      - *clone
+      - *setup-uv
+      - name: pytest (x64 lane)
+        env:
+          MPLBACKEND: agg
+          JAX_PLATFORMS: cpu
+          JAX_ENABLE_X64: "1"
+        # exit code 5 = no tests collected (M0 has no x64 test yet)
+        run: uv run --locked pytest -v --color=yes -m "x64 and not gpu" || test $? -eq 5
 
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
   # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
@@ -88,6 +106,7 @@ jobs:
     needs:
       - get-environments
       - test
+      - fp64
     runs-on: ubuntu-latest
     steps:
         - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2

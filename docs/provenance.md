@@ -10,3 +10,6 @@
   `tests/data/simulated_binary_6_gens_samplingNoise` (examples/1_simple_example config:
   zscore_cutoff 1.0, use_knn 10, UB_ellipsoid_size 1.0, nnn_n_randommoves 10, nnn_n_randomtrees 2),
   2026-10-13. Two independent runs bitwise identical. finalLoglik -65745.68334074633.
+- Phase 2 (2026-10): `tests/conftest.py` precision guard, `bench/metadata.py` and
+  `bench.run.count_compilations` reproduce the behaviour of helpers in the internal mlbelab project rose
+  (`tests/conftest.py`, `bench/metadata.py`, `rose/core/compile_count.py`); no licence constraint (internal).
