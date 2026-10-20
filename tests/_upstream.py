@@ -88,3 +88,16 @@ def upstream_opt_times(parent, t, x, var, tol: float = 1e-6, maxiter: int = 100)
         return out, int(nit)
     finally:
         bs_glob.reset()
+
+
+def upstream_grad(parent, t, x, var) -> tuple[float, np.ndarray]:
+    """Tree.getLikelihoodGradGivenTimes (TH:3414-3430): (L_tree, dL/dt node-indexed, 0 at the root)."""
+    try:
+        tree = _tree(parent, t, x, var)
+        inds = [i for i in range(len(parent)) if parent[i] >= 0]
+        L, g = tree.getLikelihoodGradGivenTimes(np.asarray(t)[inds], inds, mem_friendly=False)
+        out = np.zeros(len(parent))
+        out[inds] = g
+        return float(L), out
+    finally:
+        bs_glob.reset()

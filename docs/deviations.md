@@ -94,3 +94,88 @@
   `verbose` only gates extra `mp_print`/logger output inside `_core` (e.g. `main.py:148`, `main.py:157`,
   `storeTreeInFolder(..., verbose=args.verbose)` calls); it does not change any numeric result, decision
   rule or iteration order.
+
+## Phase 2 fp64 references (`bonsai._ref.pair`, not used by `_core`)
+- Tight optimiser: the reference 3-leaf solves define the optimum: the exact optimum of upstream's objective
+  (to fp64 resolution), with upstream's own solves (tol 1e-4/1e-9) within their stopping gap of it. They run
+  L-BFGS-B at machine precision (ftol 1e-15, gtol 1e-11), then a projected Newton polish (forward-FD Hessian of the analytic gradient),
+  restarting until every free coordinate has |g_i| ≤ (16 + G)·eps64·Σ_g|terms of g_i|, i.e. a gradient
+  that is zero to its own fp64 rounding. L-BFGS-B alone stops where f's decreases fall below f's rounding,
+  which can leave |g| ~ 1e-6, and it crawls on the flat tail of a log t heading for LOG_T_MIN (gradient ∝ t);
+  the polish takes such a coordinate onto its bound. Upstream scores pairs at tol 1e-4 (TH:1303). The
+  2-leaf time uses brentq at rtol 4·eps64 instead of tol 1e-4/1e-9.
+- Fallback trigger: upstream's sequential mode falls back to the joint solve when scipy reports
+  `success=False` at its loose tolerance (TH:4867, 5381-5385). The reference falls back when its
+  resolution-scaled KKT test still fails after 5 restarts (scipy's flag is not used), or when the t_12
+  bracket fails. On the 1320 sequential pairs of the kernel test families (rng 100-119), neither falls back
+  (upstream at tol 1e-4 and 1e-9). The earlier absolute test, 1e-8·(1 + |f|), fell back on 5 of them where
+  upstream did not.
+- 2-leaf bracket: upstream raises `BonsaiError` once f(ub) > 1e9 during the ×10 bracket expansion
+  (TH:4917-4919). The reference has no such check: it returns (None, not converged) once lb > 1e6, and
+  `pair_score` falls back to the joint solve. This is reachable only for Σ_g d² ≳ 1e11 (e.g. x1 = 0,
+  x2 = 2e5, v = 0.1, G = 4), never for normalised data.
+- `pair_score` raises `ValueError` when the parent has no third child, i.e. W_r − w_1 − w_2 ≤ 4·eps·W_r.
+  Upstream would continue with W_R ≈ 0 and produce NaN or inf.
+
+## Phase 2 `_engine` deviations (device kernels)
+- Pair-solver convergence and fallback (A11): upstream's sequential 3-leaf solve falls back to the
+  joint solve when scipy reports `success=False` at its own loose tolerance (`_core/tree_helpers.py`
+  TH:4867, TH:5382-5386). The device solver instead runs a fixed number of damped-Newton iterations
+  and decides convergence from a resolution-scaled projected-gradient (KKT) test on the result,
+  never from a solver status flag. Damping is adaptive Levenberg–Marquardt (λ·|diag H|, growing on
+  a rejected step, shrinking on an accepted one, capped by a Gershgorin bound), replacing a fixed
+  Gershgorin shift that missed its own convergence test on 0.5–0.8% of pairs because the shift was
+  15–50× too large in flat valleys. A step is accepted if the objective does not rise beyond its
+  derived rounding bound, or if the relative projected gradient drops while the objective rises by
+  at most a small, derived multiple of that bound (a strict-decrease rule stalls in float32; an
+  r-only rule, tried first, let the solver accept an uphill jump to a worse KKT point). Any pair
+  that still fails its convergence test after the fixed iteration budget is returned with an
+  explicit not-converged flag, never silently as a fallback or an unconverged value treated as
+  final; every flagged pair must be re-scored on the host with the fp64 reference before any merge
+  decision uses it.
+- Box handling in the device branch-length optimiser (A12): upstream's L-BFGS-B clips the iterate
+  into its box and reports convergence once the clipped gradient's zero-slope rule fires. Clipping
+  the iterate was tried for the device optimiser and rejected because it stalls L-BFGS; the device
+  optimiser instead keeps the gradient component that still points back into the box at a clipped
+  point (scipy's own projected-gradient, "pgtol", semantics) and only reports convergence there, or
+  when the optimiser's own small-step/small-change (Cauchy) rule fires (next entry). A plain
+  zero-slope rule at the box boundary was tried first and reported convergence at non-KKT points,
+  where a further step would have moved the objective by a large, easily-measured amount.
+- The float32 branch-length optimiser cannot reach upstream's default gradient tolerance (1e-6):
+  the objective's own float32 resolution is reached first, and optimistix's small-step/small-change
+  stopping rule (not the gradient-tolerance rule) fires at that point instead.
+- A child whose posterior position exactly equals its parent's as-if-root mean has no direction to
+  report (a 0/0 division, `_core/tree_helpers.py` TH:2136-2137): upstream's NumPy array crashes
+  when the result (a NaN) reaches the nearest-neighbour library's input check. The device-kNN
+  coordinate function returns the zero vector for that child instead (distance 1 to every unit
+  vector, 0 to another zero vector), avoiding the crash without changing any other child's result
+  (A13).
+- The pair solver scores each 3-leaf subproblem to its solver's own convergence tolerance (near the
+  true optimum, to float32/float64 resolution), where upstream scores it to a fixed tolerance
+  (1e-4) during candidate search (TH:1303). Because the search is otherwise a free choice
+  among positive-gain pairs, the engine's score for a given pair is typically at least upstream's
+  score for the same pair (up to rounding, when both reach the same optimum), so it can pick a
+  different, higher-scoring pair and so a different merge order than upstream on the same data.
+- When neither the sequential nor the joint 3-leaf solve converges for a pair, the engine returns
+  the sequential solve's iterate flagged not converged, so a later host re-score can still use it;
+  upstream's pair score in that situation is `-inf` and the pair is treated as having no finite
+  value.
+- Block-scheduled tree pass (A14): the device tree pass no longer pads every tree level to the
+  widest level, which scheduled 9–19× the useful rows on the trees measured (8,000-leaf random
+  tree; two real trees of 772 and 1,194 nodes). The host now builds a schedule of blocks of static
+  width B = min(256, bucketed n), ordered by level (post-order levels for the up pass, reversed for
+  the down pass); each block holds at most B nodes of a single level, padded and masked, so a pass
+  costs about (n + levels·B)·G rows. Sibling groups that span blocks are completed with carried and
+  per-block tail partial sums, so every message is still formed by sums only, without subtraction.
+  The compile key is (B, bucketed n, bucketed number of leaves, bucketed block count, G),
+  independent of the tree's shape. The leaf data are stored once per leaf, (bucketed number of
+  leaves, G), with a node-to-row index, instead of one row per node. The maths, the objective and
+  every decision rule are unchanged: the existing agreement tests against the fp64 reference, the
+  golden tree and the x64 checks pass at their unchanged, derived tolerances. Measured:
+  scheduled/useful rows per pass 1.33/1.26 (up/down) on the 8,000-leaf tree, 1.04/1.03 on a
+  100,000-leaf random tree, but 9–10 on the two real trees measured, and up to ~29 on deeper real
+  trees of similar size, where the number of levels times B dominates. Memory, from CPU
+  `memory_analysis` at 10,000 leaves × 2,000 genes, in units of one padded-nodes × genes float32
+  array: tree pass 10.3 → 6.1, times-optimiser objective 9.3 → 6.0. Indicative GPU timing (one
+  L40S, not a benchmark): tree pass 85 → 27 ms at 10,000 leaves and 1,952 → 217–228 ms at
+  100,000 leaves, peak memory 20.9 → 14.8 GB at 100,000 leaves.
