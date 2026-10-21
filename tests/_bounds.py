@@ -7,6 +7,8 @@ additively per tree level (messages are convex combinations), hence the (1 + hei
 
 import numpy as np
 
+from bonsai._ref.pair import _scales
+from bonsai._ref.star import node_message, star_loglik_grad
 from bonsai._ref.tree import postorder
 
 EPS32 = float(np.finfo(np.float32).eps)
@@ -99,3 +101,33 @@ def input_rounding(parent: np.ndarray, t: np.ndarray, var: np.ndarray, ref, eps:
     dx = np.sum(2 * np.abs(d) / T * np.abs(ref.x[leaves]))
     dv = np.sum(np.abs((-1 + d**2 / T) / T) * var[leaves])
     return float(eps * (dx + dv + np.sum(np.abs(ref.grad * t))))
+
+
+def gscale(x: np.ndarray, var: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Per child: Σ_g w_c(w_c r_c² + 1 + w_c/W), the absolute size of dell/dt_c's terms (TH:5107)."""
+    w = 1.0 / (var + t[:, None])
+    xn, W = node_message(x, var, t)
+    return np.sum(w * (w * (xn - x) ** 2 + 1.0 + w / W), axis=1)
+
+
+def ell_scale(x: np.ndarray, var: np.ndarray, t: np.ndarray) -> float:
+    """Σ|terms| of a star's ell incl. the cross term of forming r = x̄ − x_c (``_ref.pair._scales``)."""
+    return _scales(t, x, var)[0]
+
+
+def fd_dell_dt(x: np.ndarray, var: np.ndarray, t: np.ndarray, c: int) -> tuple[float, float]:
+    """(FD of dell/dt_c from ``star_loglik_grad``'s ell, gscale_c), h = 1e-4·max(t_c, 1e-3).
+
+    Central for t_c > 0 (truncation ~h²·|third derivative|), forward at the bound t_c = 0 (~h·|second
+    derivative|); rounding ~eps64·Σ|ell terms|/h.
+    """
+    h = 1e-4 * max(t[c], 1e-3)
+    tp, tm = t.copy(), t.copy()
+    tp[c] += h
+    f = lambda tt: star_loglik_grad(x, var, tt)[0]
+    if t[c] > 0:
+        tm[c] -= h
+        fd = (f(tp) - f(tm)) / (2 * h)
+    else:
+        fd = (f(tp) - f(t)) / h
+    return fd, float(gscale(x, var, t)[c])

@@ -1,10 +1,11 @@
 import numpy as np
 import pytest
 
-from bonsai._ref.star import as_if_root, node_message, star_loglik_grad, two_leaf_dlogl
+from bonsai._ref import star as rstar
+from bonsai._ref.star import as_if_root, node_message, star_em, star_loglik_grad, two_leaf_dlogl
 from bonsai._ref.tree import tree_loglik_grad
 
-from ._bounds import EPS64, tree_height, tree_tols
+from ._bounds import EPS64, ell_scale, fd_dell_dt, tree_height, tree_tols
 from ._trees import random_leaf_data, random_tree, reroot
 
 
@@ -199,3 +200,91 @@ def test_tree_gradient_raises_on_unary_root():
     var = np.array([[0.2, 0.3], [1.0, 1.0]])
     with pytest.raises(ValueError, match="unary root"):
         tree_loglik_grad(parent, t, x, var)
+
+
+def star_fixture(rng, C=12, G=40):
+    """(C, G) children from ``random_leaf_data``; child 0 = the mean of the others with var 1, so its
+    derivative at t = 0 is negative and the star optimum clamps it (both KKT branches occur)."""
+    x, var = random_leaf_data(np.zeros(C), G, rng)
+    x[0], var[0] = x[1:].mean(axis=0), 1.0
+    return x, var
+
+
+# A Jacobi stop at |Δt| = tol leaves |dell/dt_c| ~ tol·H_cc ~ tol·gscale_c, so 1e-6·gscale separates
+# a tight fixed point from one stopped early (tol ≥ 1e-4). The FD error must sit well below it:
+# truncation ~h²·|third derivative| ~ 1e-8·gscale (h = 1e-4·t_c), and rounding of the two ell
+# evaluations ≤ 2·eps64·Σ|ell terms|/(2h) central, /h forward,
+# asserted ≤ ½·1e-6·gscale per child (the other half covers truncation).
+KKT_REL = 1e-6
+
+
+def _kkt_violations(x, var, t):
+    """Children violating the star KKT conditions (dell/dt_c = 0 if t_c > 0, ≤ 0 at t_c = 0), by FD."""
+    bad = []
+    for c in range(len(t)):
+        fd, gs = fd_dell_dt(x, var, t, c)
+        h = 1e-4 * max(t[c], 1e-3)
+        assert 2 * EPS64 * ell_scale(x, var, t) / h <= 0.5 * KKT_REL * gs  # FD resolves the bound
+        if (abs(fd) if t[c] > 0 else fd) > KKT_REL * gs:
+            bad.append(c)
+    return bad
+
+
+def test_ref_star_em_kkt_by_finite_differences():
+    x, var = star_fixture(np.random.default_rng(3))
+    t, ell, ok = star_em(x, var, tol=1e-12)
+    assert ok and np.any(t == 0) and np.any(t > 0)  # the fixture covers both KKT branches
+    assert _kkt_violations(x, var, t) == []
+    assert ell == star_loglik_grad(x, var, t)[0]
+    assert ell >= star_loglik_grad(x, var, np.ones(len(t)))[0]  # not worse than the start t = 1
+
+
+def test_ref_star_em_loose_tol_fails_kkt():
+    """Non-vacuity: stopping the sweeps at |Δt| < 1e-2 leaves a child outside the KKT bound."""
+    x, var = star_fixture(np.random.default_rng(3))
+    t, _, ok = star_em(x, var, tol=1e-2)
+    assert ok and _kkt_violations(x, var, t) != []
+
+
+def test_ref_star_em_stops_on_absolute_change(monkeypatch):
+    """Stop rule max_c |Δt_c| < tol, absolute (TH:5000-5004): the iterates fed to each sweep's parent
+    message are recorded; the last sweep changed t by < tol, the one before by ≥ tol. Data ×10 puts the
+    times near 50-100, where a relative rule would stop sweeps earlier."""
+    x, var = star_fixture(np.random.default_rng(3))
+    x = 10 * x
+    seen = []
+
+    def spy(xx, vv, tt):
+        seen.append(tt.copy())
+        return node_message(xx, vv, tt)
+
+    monkeypatch.setattr(rstar, "node_message", spy)
+    t, _, ok = star_em(x, var, tol=1e-4)
+    assert ok and len(seen) >= 3 and t.max() > 10
+    assert np.max(np.abs(t - seen[-1])) < 1e-4 <= np.max(np.abs(seen[-1] - seen[-2]))
+
+
+def test_ref_star_em_not_worse_than_upstream():
+    """Upstream (tol 1e-4 sweeps, brentq 1e-4) stops within its own gap of the tight optimum."""
+    from bonsai._core.tree_helpers import optimiseTStar
+
+    x, var = star_fixture(np.random.default_rng(3))
+    t_up, ell_up, _, _ = optimiseTStar(x.T.copy(), var.T.copy())
+    t, ell, ok = star_em(x, var, tol=1e-12)
+    assert ok and ell_up > -1e9  # both completed
+    # same ell formula up to op order: fp64 rounding ≤ 8·eps64·Σ|terms| ≈ 1e-13·|ell| here; 1e-12·|ell| bounds it
+    assert ell >= ell_up - 1e-12 * abs(ell_up)
+
+
+def test_ref_star_em_bfgs_fallback(monkeypatch):
+    """Sweeps not converged (max_sweeps=1): BFGS on log t (TH:5009); BFGS failing → (ones, −1e9, False)."""
+    x, var = star_fixture(np.random.default_rng(3))
+    t_bfgs, ell_bfgs, ok = star_em(x, var, max_sweeps=1)
+    assert not ok and np.all(np.isfinite(t_bfgs)) and ell_bfgs > star_loglik_grad(x, var, np.ones(len(x)))[0]
+
+    class Failed:
+        success = False
+
+    monkeypatch.setattr(rstar, "minimize", lambda *a, **k: Failed())
+    t, ell, ok = star_em(x, var, max_sweeps=1)
+    assert np.array_equal(t, np.ones(len(x))) and (ell, ok) == (-1e9, False)
