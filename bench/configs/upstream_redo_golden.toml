@@ -1,0 +1,16 @@
+# M2 golden baseline (A22, ruling 6): upstream backend stopped after redo starry on the golden fixture.
+# No ground truth is scored here; the redo-starry tree is the gate's A1-only reference.
+[run]
+name = "upstream_redo_golden"
+seed = 0
+backend = "upstream"
+n_warm = 0
+stop_after = "redo_starry"
+
+[data]
+kind = "real"
+path = "tests/data/simulated_binary_6_gens_samplingNoise"
+
+[upstream]
+nnn_n_randommoves = 10
+nnn_n_randomtrees = 2

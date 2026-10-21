@@ -11,6 +11,9 @@ from bench.simulators.brownian import simulate
 from bonsai._ref.newick import children_lists, parse_newick
 
 CONFIGS = run.metadata.REPO / "bench" / "configs"
+SMOKE = CONFIGS / "smoke_upstream.toml"
+SMOKE_ADATA = simulate(n_cells=24, n_genes=60, seed=0).adata
+SMOKE_CELLS = set(SMOKE_ADATA.obs_names)
 
 
 def _write(tmp_path, text):
@@ -19,10 +22,38 @@ def _write(tmp_path, text):
     return p
 
 
-@pytest.mark.parametrize("name", ["smoke_upstream", "upstream_sim_1k", "upstream_sim_3k", "upstream_sim_10k"])
+def _record(msg):
+    """A ``logging.LogRecord`` carrying ``msg`` as its already-formatted message."""
+    return logging.LogRecord(name="myapp", level=logging.INFO, pathname="", lineno=0, msg=msg, args=(), exc_info=None)
+
+
+def preprocessed_sorted(adata):
+    """``(x, var, cell_names)`` from the independent fp64 preprocessing port (bitwise upstream, M1)."""
+    from bonsai._ref.preprocess import preprocess
+
+    leaves = preprocess(adata)
+    return leaves.x, leaves.var, list(adata.obs_names)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "smoke_upstream",
+        "upstream_sim_1k",
+        "upstream_sim_3k",
+        "upstream_sim_10k",
+        "upstream_redo_sim_1k",
+        "upstream_redo_sim_10k",
+    ],
+)
 def test_committed_configs_load(name):
     cfg = run.load_config(CONFIGS / f"{name}.toml")
     assert cfg["run"]["backend"] == "upstream" and cfg["data"]["kind"] == "simulate"
+
+
+def test_golden_config_loads():
+    cfg = run.load_config(CONFIGS / "upstream_redo_golden.toml")
+    assert cfg["run"]["stop_after"] == "redo_starry" and cfg["data"]["kind"] == "real"
 
 
 def test_real_config_needs_a_path(tmp_path):
@@ -112,6 +143,72 @@ def test_stage_log_keeps_stages_in_order_and_writes_partial_results(tmp_path):
     want = [["SPR moves", 2.5], ["Optimization of diffusion times", 0.001], ["Optimization of diffusion times", 1.0]]
     assert h.stages == want  # the two time optimisations stay separate
     assert json.loads((tmp_path / "partial.json").read_text()) == {"stages_s": want}
+
+
+def test_stage_log_raises_only_on_stop_marker():
+    log = run._StageLog(stop_after="redo_starry")
+    log.emit(_record("Redoing starry nodes took 1.5 seconds."))  # recorded, no raise
+    assert log.stages == [["Redoing starry nodes", 1.5]]
+    with pytest.raises(run._StopAfterStage):
+        log.emit(_record(run.STOP_MARKER))
+    run._StageLog(stop_after=None).emit(_record(run.STOP_MARKER))  # never raises
+
+
+def test_set_overrides_parse_and_validate(tmp_path):
+    cfg = run.load_config(SMOKE, sets=["run.seed=2", "run.stop_after=redo_starry", "upstream.use_knn=5"])
+    assert (cfg["run"]["seed"], cfg["run"]["stop_after"], cfg["upstream"]["use_knn"]) == (2, "redo_starry", 5)
+    for bad in ["run.stop_after=nni", "nosuch.key=1", "run.nosuch=1", "run.seed"]:
+        with pytest.raises(run.ConfigError):
+            run.load_config(SMOKE, sets=[bad])
+
+
+def test_leaf_sha256_is_order_canonical():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(5, 3))
+    var = rng.uniform(0.5, 2.0, size=(5, 3))
+    names = ["e", "d", "c", "b", "a"]
+    perm = [4, 3, 2, 1, 0]  # same cells, rows permuted (with their names)
+    h = run.leaf_sha256(x, var, names)
+    assert run.leaf_sha256(x[perm], var[perm], [names[i] for i in perm]) == h
+    x_changed = x.copy()
+    x_changed[0, 0] = np.nextafter(x_changed[0, 0], np.inf)  # one changed float flips the hash
+    assert run.leaf_sha256(x_changed, var, names) != h
+    var_changed = var.copy()
+    var_changed[0, 0] = np.nextafter(var_changed[0, 0], np.inf)  # ``var`` is hashed too, not just ``x``
+    assert run.leaf_sha256(x, var_changed, names) != h
+
+
+def test_run_upstream_raises_if_stop_marker_never_fires(monkeypatch):
+    """A run that somehow completes without hitting STOP_MARKER must never be labelled stage-limited."""
+    monkeypatch.setattr(run.tl, "reconstruct", lambda *a, **k: None)  # "succeeds" without raising _StopAfterStage
+    with pytest.raises(RuntimeError, match="stop_after"):
+        run.run_upstream({}, {}, out=None, tag="run0", stop_after="redo_starry")
+
+
+@pytest.mark.slow
+def test_upstream_stop_after_redo_starry_smoke(tmp_path):
+    out = run.main(["--config", str(SMOKE), "--set", "run.stop_after=redo_starry", "--out", str(tmp_path)])
+    r = json.loads((out / "results.json").read_text())["runs"][0]
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta["sets"] == ["run.stop_after=redo_starry"]
+    names = [s for s, _ in r["stages_s"]]
+    # Upstream logs a "Storing tree in folder" housekeeping stage after both the greedy and the
+    # redo-starry stage, so the trailing two are not the stage names themselves (deviation from the
+    # plan's literal example); the last real stage is still "Redoing starry nodes", after the greedy one.
+    assert names[-2:] == ["Redoing starry nodes", "Storing tree in folder"]
+    assert names.index("First greedy maximisation of tree likelihood") < names.index("Redoing starry nodes")
+    assert "Optimization of diffusion times" not in names
+    assert r["stage_newick"]["greedy"] != r["stage_newick"]["redo_starry"]  # redo starry actually ran a merge
+    p, t, nm = parse_newick(r["stage_newick"]["redo_starry"])
+    assert r["newick"] == r["stage_newick"]["redo_starry"]
+    assert {n for n, k in zip(nm, children_lists(p), strict=True) if not k} == set(SMOKE_CELLS)
+    # redo starry only applies merges with dLogL > 1e-6 and collapses zero edges, so it strictly raises L on
+    # this fixture (measured: greedy -274.4696 vs redo-starry -273.0296); catches "greedy" harvested from the
+    # redo-starry folder (which would make this an equality, not a strict increase).
+    assert r["loglik"]["value"] > r["loglik"]["greedy_stage"]
+    assert not any(tmp_path.rglob("run0_workdir"))  # workdir removed after harvest
+    assert "upstream_finalLoglik" not in r["loglik"] and len(r["genes_used"]) == r["n_genes_used"]
+    assert r["leaf_sha256"] == run.leaf_sha256(*preprocessed_sorted(SMOKE_ADATA))  # same as the port's arrays
 
 
 def test_leaf_arrays_maps_rows_by_cell_ids_not_obs_order():
