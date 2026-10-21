@@ -1,6 +1,7 @@
-"""Tree-accuracy metrics against a ground-truth tree (amendment A7).
+"""Tree-accuracy metrics against a ground-truth tree (amendments A7, A15).
 
 Unrooted quartet accuracy and normalised Robinson–Foulds distance; neither depends on the rooting.
+``contract_zero_edges`` turns zero-length internal edges into polytomies before scoring (A15).
 """
 
 from itertools import combinations
@@ -71,11 +72,12 @@ def _quartet_split(parent: np.ndarray, rows: np.ndarray) -> np.ndarray:
 
 
 def quartet_accuracy(tree_a, tree_b, n_samples: int = 100_000, seed: int = 0) -> tuple[float, int]:
-    """Fraction of leaf quartets with the same unrooted split, or unresolved in both (amendment A7).
+    """Mean quartet score of ``tree_b`` against ``tree_a`` (amendment A15).
 
-    ``tree_*`` = (parent, names). All C(N, 4) quartets if that is ≤ ``n_samples``, else
-    ``n_samples`` uniformly random draws, keeping those of four distinct leaves. Returns
-    (accuracy, n_quartets).
+    Per quartet: 1 if both trees give the same unrooted split or both leave it unresolved, 1/3 if
+    exactly one leaves it unresolved, 0 otherwise. ``tree_*`` = (parent, names). All C(N, 4)
+    quartets if that is ≤ ``n_samples``, else ``n_samples`` uniformly random draws, keeping those
+    of four distinct leaves. Returns (accuracy, n_quartets).
     """
     leaves = sorted(n for n, k in zip(tree_a[1], postorder(tree_a[0])[1], strict=True) if not k)
     ra = _leaf_rows(tree_a[0], tree_a[1], leaves)
@@ -88,8 +90,31 @@ def quartet_accuracy(tree_a, tree_b, n_samples: int = 100_000, seed: int = 0) ->
         quads = quads[np.array([len(set(q)) == 4 for q in quads.tolist()], dtype=bool)]
     if len(quads) == 0:
         raise ValueError("no quartets: fewer than 4 leaves, or every sampled draw was rejected")
-    same = _quartet_split(tree_a[0], ra[quads]) == _quartet_split(tree_b[0], rb[quads])
-    return float(same.mean()), len(quads)
+    sa, sb = _quartet_split(tree_a[0], ra[quads]), _quartet_split(tree_b[0], rb[quads])
+    return float(np.where(sa == sb, 1.0, np.where((sa < 0) ^ (sb < 0), 1 / 3, 0.0)).mean()), len(quads)
+
+
+def contract_zero_edges(
+    parent: np.ndarray, t: np.ndarray, names: list[str], snap: float = 0.0
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Remove every non-root internal node with ``t < snap`` or ``t == 0`` and compact (amendment A15).
+
+    The removed node's children are re-attached to its nearest kept ancestor with their own t.
+    Leaves (cells) and the root are never removed. Returns the compacted (parent, t, names); kept
+    nodes keep their relative order.
+    """
+    parent, t = np.asarray(parent, dtype=np.int64), np.asarray(t, dtype=np.float64)
+    _, kids = postorder(parent)
+    drop = np.array([p >= 0 and bool(k) and (ti < snap or ti == 0) for p, k, ti in zip(parent, kids, t, strict=True)])
+    up = parent.copy()  # nearest kept ancestor; ancestors precede their descendants in pre-order
+    for v in postorder(parent)[0][::-1]:
+        if up[v] >= 0 and drop[up[v]]:
+            up[v] = up[up[v]]
+    keep = np.flatnonzero(~drop)
+    new = np.full(len(parent), -1, dtype=np.int64)
+    new[keep] = np.arange(len(keep))
+    pk = up[keep]
+    return np.where(pk >= 0, new[np.maximum(pk, 0)], -1), t[keep], [names[i] for i in keep]
 
 
 def _splits(parent: np.ndarray, rows: np.ndarray) -> set[int]:

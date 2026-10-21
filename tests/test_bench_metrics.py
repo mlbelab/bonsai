@@ -4,7 +4,7 @@ from itertools import combinations, permutations
 import numpy as np
 import pytest
 from bench import metrics as _metrics
-from bench.metrics import quartet_accuracy, rf_distance
+from bench.metrics import contract_zero_edges, quartet_accuracy, rf_distance
 
 from bonsai._ref.newick import parse_newick
 from bonsai._ref.tree import postorder
@@ -25,10 +25,50 @@ def test_four_leaf_examples():
     assert quartet_accuracy(a, _tree("(a,(b,(c,d)));")) == (1.0, 1)  # same unrooted tree, other root
 
 
-def test_unresolved_quartets_count_only_if_unresolved_in_both():
-    star, resolved = _tree("(a,b,c,d);"), _tree("((a,b),c,d);")
-    assert quartet_accuracy(star, star) == (1.0, 1)
-    assert quartet_accuracy(star, resolved) == (0.0, 1)
+def test_unresolved_quartet_scores_one_third():
+    """A15: 1 if same split or both unresolved, 1/3 if exactly one is unresolved, 0 otherwise."""
+    truth = _tree("((a:1,b:1):1,(c:1,d:1):1);")
+    star = _tree("(a:1,b:1,c:1,d:1);")
+    assert quartet_accuracy(truth, star)[0] == pytest.approx(1 / 3, abs=0)
+    assert quartet_accuracy(star, truth)[0] == pytest.approx(1 / 3, abs=0)  # either side unresolved
+    assert quartet_accuracy(star, star) == (1.0, 1)  # both unresolved
+    assert quartet_accuracy(truth, _tree("((a:1,c:1):1,(b:1,d:1):1);"))[0] == 0.0
+    assert quartet_accuracy(truth, truth)[0] == 1.0
+
+
+def test_contract_then_score_hand_count():
+    """Hand count: contracting (a,b) gives ((a,b,c),d,e); of the 5 quartets, abcd and abce become
+    unresolved (1/3 each) and abde, acde, bcde keep the truth's split: (3 + 2/3)/5 = 11/15."""
+    truth = _tree("((((a:1,b:1):1,c:1):1,d:1):1,e:1);")
+    p, t, nm = parse_newick("((((a:1,b:1):1e-6,c:1):1,d:1):1,e:1);")  # (a,b) edge below the snap
+    pc, tc, nc = contract_zero_edges(p, t, nm, snap=2e-6)
+    assert len(pc) == len(p) - 1 and len(tc) == len(nc) == len(pc)
+    assert quartet_accuracy(truth, (pc, nc))[0] == pytest.approx(11 / 15, abs=1e-15)
+    assert quartet_accuracy(truth, (p, nm))[0] == 1.0  # raw: uncontracted
+
+
+def test_contract_snap_is_strict_and_zero_always_contracts():
+    """t < snap contracts, t == snap does not (upstream's t < 2e-6 rule, TH:3467); t == 0 contracts
+    even with snap = 0."""
+    p, t, nm = parse_newick("((((a:1,b:1):2e-6,c:1):1,d:1):1,e:1);")
+    assert len(contract_zero_edges(p, t, nm, snap=2e-6)[0]) == len(p)
+    p0, t0, nm0 = parse_newick("((((a:1,b:1):0,c:1):1,d:1):1,e:1);")
+    assert len(contract_zero_edges(p0, t0, nm0)[0]) == len(p0) - 1
+
+
+def test_contract_keeps_cells_and_root():
+    """Leaves with t = 0 are kept; the root is never removed; chains of removed nodes re-attach to the
+    nearest kept ancestor; contracting one child of a two-child root keeps the unrooted splits."""
+    p, t, nm = parse_newick("(((a:0,b:1)x:0,c:1)y:0,(d:1,e:1)z:1)r:0;")
+    pc, tc, nc = contract_zero_edges(p, t, nm, snap=2e-6)
+    assert sorted(nc) == ["a", "b", "c", "d", "e", "r", "z"]  # x, y removed; leaf a (t = 0) kept
+    kids = {nc[i]: sorted(nc[j] for j in np.flatnonzero(pc == i)) for i in range(len(pc))}
+    assert kids["r"] == ["a", "b", "c", "z"] and kids["z"] == ["d", "e"]
+    assert tc[nc.index("a")] == 0.0 and tc[nc.index("b")] == 1.0  # own times kept
+    p2, t2, nm2 = parse_newick("((a:1,b:1)x:1e-9,(c:1,d:1,e:1)z:1)r:0;")
+    pc2, _, nc2 = contract_zero_edges(p2, t2, nm2, snap=2e-6)
+    assert "x" not in nc2 and "r" in nc2
+    assert rf_distance((p2, nm2), (pc2, nc2)) == 0.0  # {a,b}|{c,d,e} survives as the root's other side
 
 
 def _named(parent):
