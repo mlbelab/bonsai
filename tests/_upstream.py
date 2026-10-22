@@ -101,3 +101,59 @@ def upstream_grad(parent, t, x, var) -> tuple[float, np.ndarray]:
         return float(L), out
     finally:
         bs_glob.reset()
+
+
+def upstream_merge_children(x, var, t, mode: str = "sequential") -> list[tuple[str, frozenset, frozenset]]:
+    """Upstream's greedy decisions at a root with C leaf children (``mergeChildrenUB``, TH:1039-1620).
+
+    ``x``, ``var``: (C, G) leaves (cells), ``t``: (C,) their times. Returns, per decision,
+    ("merge" | "reopt" | "reset", leaf ids under child 1, under child 2); empty sets for "reopt".
+    Recorded by wrapping ``TreeNode.mergeNodes``, ``optimiseConnected`` and ``resetChildTimes`` (test
+    side; ``_core`` untouched). With C ≤ 10 upstream uses neither bounds nor kNN (``nChildUB``,
+    ``nChildNN``), so every round scores all pairs.
+    """
+    C, G = x.shape
+    decisions: list[tuple[str, frozenset, frozenset]] = []
+    orig = {name: getattr(TreeNode, name) for name in ("mergeNodes", "optimiseConnected", "resetChildTimes")}
+
+    def leaves(node) -> frozenset:
+        return frozenset([node.nodeInd]) if node.isLeaf else frozenset().union(*map(leaves, node.childNodes))
+
+    def pair(kind):
+        def wrapped(self, xr, Wr, i1, i2, *args, **kwargs):
+            kids = {c.nodeInd: c for c in self.childNodes}
+            decisions.append((kind, leaves(kids[i1]), leaves(kids[i2])))
+            return orig["mergeNodes" if kind == "merge" else "resetChildTimes"](self, xr, Wr, i1, i2, *args, **kwargs)
+
+        return wrapped
+
+    def reopt(self, *args, **kwargs):
+        decisions.append(("reopt", frozenset(), frozenset()))
+        return orig["optimiseConnected"](self, *args, **kwargs)
+
+    try:
+        TreeNode.mergeNodes, TreeNode.resetChildTimes = pair("merge"), pair("reset")  # type: ignore[method-assign]
+        TreeNode.optimiseConnected = reopt  # type: ignore[method-assign]
+        root = _tree(
+            np.r_[np.full(C, C), -1], np.r_[t, 0.0], np.vstack([x, np.zeros(G)]), np.vstack([var, np.ones(G)])
+        ).root
+        assert root is not None
+        for child in root.childNodes:
+            child.isCell = True  # type: ignore[assignment]  # leaves are cells (never add-as-child ancestors)
+        root.getLtqsComplete(mem_friendly=False)
+        bs_glob.max_node_ind = C
+        root.mergeChildrenUB(
+            root.ltqs,
+            root.getW(),
+            sequential=mode == "sequential",
+            ellipsoidSize=1.0,
+            nChildNN=50,
+            kNN=10,
+            mergeDownstream=False,
+            singleProcess=True,
+        )
+    finally:
+        for name, fn in orig.items():
+            setattr(TreeNode, name, fn)
+        bs_glob.reset()
+    return decisions
