@@ -286,7 +286,7 @@ def test_retime_other_scipy_status_is_invalid(monkeypatch):
 
 @pytest.mark.x64
 def test_cg_cap_scales_with_free_set(monkeypatch):
-    """A16c: CG cap = max(MAX_CG, n_free); with MAX_CG lowered below n_free the cap is n_free.
+    """A16e: CG cap = max(MAX_CG, 2·n_free): 2·n_free when that exceeds MAX_CG, else MAX_CG.
 
     Also checks ``retime`` passes its own A16 acceptance bound through to ``remaining_gap`` (a dropped
     ``bound`` argument, e.g. a stray ``0.0``, would silently disable the A16d plateau alternative).
@@ -301,8 +301,12 @@ def test_cg_cap_scales_with_free_set(monkeypatch):
     monkeypatch.setattr(rt, "remaining_gap", spy)
     monkeypatch.setattr(rt, "MAX_CG", 10)
     retime(*_case(30, 50))
-    assert seen["n_free"] > 10 and seen["max_cg"] == seen["n_free"]
+    assert seen["n_free"] > 5 and seen["max_cg"] == 2 * seen["n_free"]
     assert seen["bound"] == _bound(30, 50)
+    big = 10 * seen["n_free"]
+    monkeypatch.setattr(rt, "MAX_CG", big)
+    retime(*_case(30, 50))
+    assert seen["max_cg"] == big
 
 
 def _early_stops(monkeypatch, n_early, status=0):

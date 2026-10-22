@@ -1,4 +1,4 @@
-"""Float64 gate re-timer (amendments A16, A16b, A16c): ``python -m bench.retime IN.npz OUT.npz``.
+"""Float64 gate re-timer (amendments A16, A16b-A16e): ``python -m bench.retime IN.npz OUT.npz``.
 
 Maximises L_tree over s = log t of every non-root edge with scipy L-BFGS-B (ftol 0, gtol 1e-12),
 using the engine's float64 ``tree_loglik_grad`` (needs ``JAX_ENABLE_X64=1``; ``bench.gate`` runs
@@ -33,7 +33,7 @@ from bonsai._ref import tree as ref_tree
 
 OPTIONS = {"ftol": 0.0, "gtol": 1e-12, "maxiter": 15000, "maxfun": 30000}  # per run (A16b)
 MAX_RESTARTS = 10
-MAX_CG = 2000  # CG cap = max(MAX_CG, n_free) (A16c)
+MAX_CG = 2000  # CG cap = max(MAX_CG, 2·n_free) (A16e)
 FD_H = 1e-4  # step in s (along a unit direction) of the central-FD Hessian-vector product
 L_MATCH_REL = 1e-10  # |L_engine64 − L_ref| / |L_ref| above this → INVALID
 GAP_FRAC = 1e-2  # bound = GAP_FRAC · 1e-6 · N · G (A1 slack per entry is 1e-6)
@@ -222,7 +222,7 @@ def retime(parent, t, x, var) -> RetimeResult:
         hvp,
         _grad_scale(parent, t_fin, R),
         bound,
-        max_cg=max(MAX_CG, int(free.sum())),
+        max_cg=max(MAX_CG, 2 * int(free.sum())),
         line_search=lambda p: line_gain(ref_L, s, p),
     )
     reasons = [
