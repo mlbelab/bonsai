@@ -7,6 +7,7 @@ additively per tree level (messages are convex combinations), hence the (1 + hei
 
 import numpy as np
 
+from bonsai._engine.greedy import pair_round_resolution
 from bonsai._ref.pair import _scales
 from bonsai._ref.star import node_message, star_loglik_grad
 from bonsai._ref.tree import postorder
@@ -155,15 +156,6 @@ def _score_with_rest(uh, mode: str):
         return rp.pair_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode)
 
 
-def _round_terms(w, xbar, xs, W, eps: float) -> tuple[float, float]:
-    """(Σ_g ρ_g, Σ_g T_g) of one 3-star term (plan's r_round), per gene summed."""
-    r = xbar - xs
-    X = np.abs(xs).max(axis=0)
-    T = (np.abs(np.log(w)) + w * r * r).sum(axis=0) + np.abs(np.log(W))
-    rho = ((np.abs(np.log(w)) + 2) + w * (6 * r * r + 12 * np.abs(r) * X)).sum(axis=0) + (np.abs(np.log(W)) + 4) + 6 * T
-    return float(rho.sum()), float(T.sum())
-
-
 def _rest(uh, eps: float):
     """(x_R, v_R, eps) of û: as recorded for a device row; for a host re-scored row (xR None) the reference's own
     ``rest_of_parent`` at the host's fp64 inputs, with eps64 (the host computes in fp64)."""
@@ -191,13 +183,7 @@ def pair_resolution(d_u: float, uh, mode: str, eps: float = EPS32):
         return np.inf, s
     x1, v1, t1, x2, v2, t2, xr, Wr, _, _ = uh
     xR, vR, eps = _rest(uh, eps)
-    xs, vs = np.stack([x1, x2, xR]), np.stack([v1, v2, vR])
-    w = 1.0 / (vs + s.t[:, None])
-    W = w.sum(axis=0)
-    rho_n, T_n = _round_terms(w, (w * xs).sum(axis=0) / W, xs, W, eps)
-    w_old = np.stack([1.0 / (v1 + t1), 1.0 / (v2 + t2), 1.0 / vR])
-    rho_o, T_o = _round_terms(w_old, xr, xs, Wr, eps)
-    r_round = eps * (rho_n + rho_o + T_n + T_o + 9 * T_n)
+    r_round = pair_round_resolution(x1, v1, t1, x2, v2, t2, xR, vR, xr, Wr, s.t, eps)  # the engine's A24 estimate
     return abs(s.dlogl - d_u) + r_round, s
 
 
