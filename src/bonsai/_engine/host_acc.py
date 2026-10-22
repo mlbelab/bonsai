@@ -1,9 +1,11 @@
 """float64 host accumulators of a parent's message (amendment A8).
 
 A parent with many children (the root during the greedy pass: N children) keeps W = Σ_c w_c and
-WX = Σ_c w_c x_c as float64 NumPy G-vectors, updated once per merge from small device transfers.
-Same-weight rule: the float32 weight w_c that was added (computed on the device) is the one
-subtracted; float32 → float64 is exact, and so is the float64 product of two float32 numbers, so
+WX = Σ_c w_c x_c as float64 NumPy G-vectors, updated once per merge.
+Same-weight rule by recomputation (A21): the M2 engine computes each weight on the host in float64,
+w_c = 1/(v_c + t_c) from the stored compute-dtype message v_c (widened exactly) and the float64 t_c
+(``greedy.NodeTable.weights64``). The same expression on the same stored values gives the same w_c
+every time, so the weight subtracted is the one added, without device → host weight transfers, and
 removing a child leaves exactly the sum over the other children (up to float64 rounding).
 The child count n is tracked too: for a 2-child parent W_R = W − w_1 − w_2 is rounding noise whose
 size depends on the update history, so ``rest`` guards on the exact count, not on a threshold.
@@ -28,7 +30,7 @@ class ParentAcc:
 
     @classmethod
     def from_children(cls, w, x) -> "ParentAcc":
-        """From the device float32 child weights w (C, G) and child means x (C, G)."""
+        """From the child weights w (C, G) and child means x (C, G), widened to float64."""
         w, x = _f64(w), _f64(x)
         return cls(w.sum(axis=0), (w * x).sum(axis=0), len(w))
 
