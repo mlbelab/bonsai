@@ -13,6 +13,7 @@ with the A19 rebuild schedule; ``merges_per_round`` at the root (A20). A merge w
 rounding resolution of the 1e-6 threshold is decided on the fp64 host re-score (A24).
 """
 
+import time
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -62,6 +63,7 @@ class GreedyConfig:
     merges_per_round: int = 1  # m, root pass only (A17 R3, A20)
     new_batch: int = 64  # rows per batch of new pairs, scored right after a merge or rebuild when bounds are on
     star_tol: float = STAR_TOL
+    false_stop_check: bool = False  # diagnostic (A24): at each stop, host-re-score every near-threshold candidate
 
 
 class GreedyStats(NamedTuple):
@@ -74,6 +76,11 @@ class GreedyStats(NamedTuple):
     n_reopts: int
     n_flagged_used_unrescored: int  # guard: flagged device rows stored without a host re-score; must stay 0
     n_threshold_rescored: int  # chosen pairs re-scored on the host because d − 1e-6 ≤ their resolution (A24)
+    # False-stop diagnostic (cfg.false_stop_check; never changes decisions):
+    n_stop_events: int = 0  # stops examined
+    n_false_stop_events: int = 0  # of those, stops with at least one band row whose fp64 d > 1e-6
+    n_band_rows: int = 0  # candidates re-scored on the host at stops (inside the resolution band)
+    stop_check_s: float = 0.0  # wall time spent in the diagnostic
 
 
 @eqx.filter_jit(donate="all")
@@ -268,7 +275,20 @@ def greedy_star(
     cap = len(table.parent)
     kids = table.children(p)
     events: list[Event] = []
-    n = {"scores": 0, "host": 0, "batches": 0, "rescored": 0, "rebuilds": 0, "reopts": 0, "unrescored": 0, "thr": 0}
+    n = {
+        "scores": 0,
+        "host": 0,
+        "batches": 0,
+        "rescored": 0,
+        "rebuilds": 0,
+        "reopts": 0,
+        "unrescored": 0,
+        "thr": 0,
+        "stop": 0,
+        "false": 0,
+        "band": 0,
+        "stop_s": 0.0,
+    }
     eps = float(np.finfo(dt).eps)
     store = _Store()
     mv = {"Dx": 0.0, "DW": 0.0, "epoch": 0}
@@ -337,22 +357,45 @@ def greedy_star(
         a, b = ref_pair.ub_slopes(ref, xr, Wr) if np.isfinite(ref.dlogl) else (0.0, 0.0)
         return ref.dlogl, ref.t, a, b
 
-    def threshold_rescore(r: int) -> bool:
-        """A24: re-score row r on the host (fp64) if its device d > 1e-6 is within its resolution of 1e-6; True if so."""
-        if store.host[r] or not store.d[r] > ACCEPT_DLOGL:
-            return False
+    def resolution(r: int) -> float:
+        """The fp32 rounding resolution of store row r's device score (``pair_round_resolution``)."""
         i, j = (int(c) for c in store.ij[r])
         xr, Wr = acc.message()
         w1, w2 = table.weights64(i), table.weights64(j)
         xR, WR = acc.rest(w1, table.x64(i), w2, table.x64(j))
         args = (table.x64(i), table.v64(i), table.t[i], table.x64(j), table.v64(j), table.t[j], xR, 1.0 / WR, xr, Wr)
-        if store.d[r] - ACCEPT_DLOGL > pair_round_resolution(*args, store.t3[r], eps):
+        return pair_round_resolution(*args, store.t3[r], eps)
+
+    def threshold_rescore(r: int) -> bool:
+        """A24: re-score row r on the host (fp64) if its device d > 1e-6 is within its resolution of 1e-6; True if so."""
+        if store.host[r] or not store.d[r] > ACCEPT_DLOGL:
+            return False
+        i, j = (int(c) for c in store.ij[r])
+        if store.d[r] - ACCEPT_DLOGL > resolution(r):
             return False
         store.d[r], store.t3[r], store.a[r], store.b[r] = host_score(i, j)
         store.host[r] = True  # fresh at the current epoch, as before
         n["thr"] += 1
         n["host"] += 1
         return True
+
+    def count_false_stops() -> None:
+        """Count false stops (diagnostic; reads the store, never writes it).
+
+        Host-re-scores EVERY candidate that could be a false stop: fresh device rows with 1e-6 − d ≤ r(p), and stale
+        rows whose bound UB lies in (1e-6 − r(p), 1e-6]. A stop is flagged if any of them has fp64 d > 1e-6.
+        """
+        t0 = time.perf_counter()
+        fresh = store.epoch == mv["epoch"]
+        val = np.where(fresh, store.d, store.ub(mv["Dx"], mv["DW"]))  # device score, or the bound of a stale row
+        ok = (fresh & ~store.host) | (~fresh & (store.epoch >= 0))
+        cand = np.flatnonzero(ok & np.isfinite(val) & (val <= ACCEPT_DLOGL))
+        rows = [r for r in cand if ACCEPT_DLOGL - val[r] <= resolution(r)]
+        hits = [host_score(*(int(c) for c in store.ij[r]))[0] > ACCEPT_DLOGL for r in rows]
+        n["stop"] += 1
+        n["band"] += len(rows)
+        n["false"] += int(any(hits))
+        n["stop_s"] += time.perf_counter() - t0
 
     def score_new() -> None:
         """With bounds on, score the never-scored candidates now (batches of ``new_batch``); else certify does."""
@@ -517,6 +560,8 @@ def greedy_star(
                 rebuild()
                 score_new()
                 continue
+            if cfg.false_stop_check:
+                count_false_stops()
             break
         for i, j, t3, dlogl in [(*store.ij[r].tolist(), store.t3[r].copy(), float(store.d[r])) for r in picks(best)]:
             merge(i, j, t3, dlogl)
@@ -535,4 +580,8 @@ def greedy_star(
         n["reopts"],
         n["unrescored"],
         n["thr"],
+        n["stop"],
+        n["false"],
+        n["band"],
+        n["stop_s"],
     )

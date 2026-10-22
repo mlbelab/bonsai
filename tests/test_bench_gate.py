@@ -222,3 +222,21 @@ def test_gate_rejects_upstream_folder_as_jax_arm(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="jax arm must be a bench run dir"):
         gate_mod.gate(a, b)
+
+
+def test_gate_truth_comes_from_the_upstream_arms_config(tmp_path, monkeypatch):
+    """The jax arm's config may not pick the truth: a jax config with another seed/size is ignored."""
+    a, b, _ = _sim_arms(tmp_path)
+    res = json.loads((a / "results.json").read_text())
+    res["config"] = {"run": {"seed": 9}, "data": {"kind": "simulate", "n_cells": 30, "n_genes": 60}}
+    (a / "results.json").write_text(json.dumps(res))
+    seen = []
+
+    def spy(cfg):
+        seen.append(cfg)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(gate_mod, "load_data", spy)
+    with pytest.raises(RuntimeError, match="stop"):
+        gate_mod.gate(a, b)
+    assert seen[0]["run"]["seed"] == 0 and seen[0]["data"]["n_cells"] == 24

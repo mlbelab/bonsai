@@ -1,0 +1,17 @@
+# M2 gate arm (jax backend) on the golden fixture; A1 only (no ground truth).
+# Run: --set run.upstream_dir=<upstream_redo_golden run dir> (A23: the baseline's saved leaf arrays).
+[run]
+name = "jax_golden"
+seed = 0
+backend = "jax"
+n_warm = 1
+
+[data]
+kind = "real"
+path = "tests/data/simulated_binary_6_gens_samplingNoise"
+
+[jax]
+mode = "sequential"
+rescore_top = 256
+merges_per_round = 1
+false_stop_check = true  # diagnostic; R2 timing arms: --set jax.false_stop_check=false

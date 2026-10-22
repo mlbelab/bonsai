@@ -1,0 +1,19 @@
+# M2 gate arm (jax backend), simulated 1k x 3.2k: same data as upstream_redo_sim_1k.toml.
+# Run: --set run.seed=S --set run.name=... --set run.upstream_dir=<that seed's upstream_redo_sim_1k run dir>
+# (A23: the jax arm runs on the baseline's saved leaf arrays); A17 settings via --set jax.mode= / jax.rescore_top= / jax.merges_per_round=.
+[run]
+name = "jax_sim_1k"
+seed = 0
+backend = "jax"
+n_warm = 1
+
+[data]
+kind = "simulate"
+n_cells = 1000
+n_genes = 3200
+
+[jax]
+mode = "sequential"
+rescore_top = 256
+merges_per_round = 1
+false_stop_check = true  # diagnostic; R2 timing arms: --set jax.false_stop_check=false

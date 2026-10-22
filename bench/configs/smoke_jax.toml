@@ -1,0 +1,18 @@
+# Seconds-to-minutes smoke run of the jax backend: same simulated data as smoke_upstream.toml.
+# Needs the baseline's results dir: --set run.upstream_dir=<dir> (A23: its leaf arrays are the jax arm's input).
+[run]
+name = "smoke_jax"
+seed = 0
+backend = "jax"
+n_warm = 1
+
+[data]
+kind = "simulate"
+n_cells = 24
+n_genes = 60
+
+[jax]
+mode = "sequential"
+rescore_top = 256
+merges_per_round = 1
+false_stop_check = true  # diagnostic; R2 timing arms: --set jax.false_stop_check=false

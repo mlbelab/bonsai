@@ -150,15 +150,15 @@ def gate(jax_dir: Path, upstream: Path, device: str | None = None) -> dict:
     for key in ("leaf_sha256", "genes_used"):
         if arms["jax"][key] != arms["upstream"][key]:
             raise ValueError(f"arms differ in {key}: refusing to gate")
-    cfg = arms["jax"]["config"]
-    if cfg is None:
+    cfg = arms["upstream"]["config"]  # the truth belongs to the baseline, not to the jax arm's config
+    if arms["jax"]["config"] is None:
         raise ValueError(f"jax arm must be a bench run dir (with results.json), got {jax_dir}")
-    _, truth = load_data(cfg)
+    truth = load_data(cfg)[1] if cfg and cfg.get("data", {}).get("kind") == "simulate" else None
     cells, genes = arms["upstream"]["cells"], arms["upstream"]["genes"]
     x, var = arms["upstream"]["x"], arms["upstream"]["var"]
     if leaf_sha256(x, var, cells) != arms["upstream"]["leaf_sha256"]:
         raise ValueError("upstream's stored leaf arrays do not match its recorded leaf_sha256")
-    seed = cfg["run"]["seed"]
+    seed = 0 if cfg is None else cfg["run"]["seed"]
     both = {k: _arm_report(a, cells, x, var, truth, seed, device) for k, a in arms.items()}
     rep, rts = {k: r for k, (r, _) in both.items()}, {k: rt for k, (_, rt) in both.items()}
     q = {k: rep[k].get("quartet_accuracy") for k in rep}
