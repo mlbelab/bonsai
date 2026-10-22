@@ -121,6 +121,7 @@ def test_select_candidate_rules():
     assert sel([-np.inf, 2, 0], [0, 3, 0], [True, False, False]) == ("rescore", [1, 2])  # -inf never eligible
     assert sel([-np.inf, 0, 0], [0, 0, 0], [True, True, True]) == ("accept", [1])
     assert sel([-np.inf] * 3, [0] * 3, [True] * 3) == ("none", [])
+    assert sel([5, 4, 1], [5, np.nan, 1], [True, False, False]) == ("rescore", [1, 2])  # NaN bound = +inf
 
 
 def _pair_scale(ref_tree, entry, i, j, t3) -> float:

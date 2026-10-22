@@ -179,3 +179,84 @@
   array: tree pass 10.3 → 6.1, times-optimiser objective 9.3 → 6.0. Indicative GPU timing (one
   L40S, not a benchmark): tree pass 85 → 27 ms at 10,000 leaves and 1,952 → 217–228 ms at
   100,000 leaves, peak memory 20.9 → 14.8 GB at 100,000 leaves.
+
+## Phase 2 M2 greedy engine (`bonsai._engine.greedy`, `bonsai._engine.build`, reference `bonsai._ref.greedy`)
+The greedy tree builder searches freely for the same objective as upstream's greedy stage (`mergeChildrenUB`,
+`_core/tree_helpers.py` TH:1039-1620, and redo starry, `mergeChildrenRecursive`, TH:968-1012). It does not replay
+upstream's merge sequence step by step; the trees are compared by likelihood and topology after redo starry. The
+fp64 reference `bonsai._ref.greedy` implements the same rules as the engine, so the entries below apply to both
+unless stated. Reproduced from upstream, not deviations: the 1e-6 merge threshold (TH:2428), the periodic star
+re-optimisation at the root every max(⌊0.05·C⌋, 10) merges (TH:1154, 2354), the add-as-child condition and order
+(TH:2467-2476), the kNN threshold of 50 children and k = 10, and the bounds-off rule for ≤ 10 children (TH:1040).
+- No zero-root branch. Upstream keeps a second running maximum for pairs whose new node lands on the parent
+  (t_aR ≤ 1e-6, TH:1342-1347) and, when such a pair is best, re-optimises the star (root) or resets the child times
+  (`resetChildTimes`, other nodes) instead of merging (TH:2381-2456, 2649-2686). It applies the test to the t_aR of its
+  loose scoring solve (tol 1e-4, TH:1303, 4853-4867), which stays far above 1e-6: re-scoring 412 such pairs (30 seeds,
+  8 cells, 30 genes) with upstream's own `calcSingleDLogL` gave t_aR > 1e-6 for all of them, so upstream merges them
+  as ordinary pairs and the branch practically never fires. The engine's solver reaches the exact optimum (often
+  t_aR ≈ 0), where the branch would fire often and change the search. The engine therefore drops it: a round merges
+  the best pair iff its dLogL > 1e-6, whatever its t_aR. Emulating the loose solve was rejected because it cannot be
+  reproduced exactly.
+- Add-as-child as a zero edge, deferred collapse. When t_1a < 1e-6 and child 1 is internal, upstream makes child 2 a
+  child of child 1 and then tries one extra merge of child 2 among child 1's children (`mergeDownstreamChildrenSingle`,
+  TH:2467-2476, 2636-2641); likewise for child 2. The engine creates the new node anyway and sets that edge to exactly
+  0, with the same condition and order (child 1, the lower id, first). A zero edge passes child 1's message unchanged,
+  so the parent's state equals upstream's. Redo starry first collapses every zero edge above an internal non-cell node
+  (upstream's `mergeZeroTimeChilds`, TH:789-807), which turns child 1's children plus child 2 into one polytomy that is
+  resolved over all pairs; this replaces upstream's single extra merge, which is dropped. For t_1a = 0 this is the same
+  tree; for 0 < t_1a < 1e-6 it moves that time by less than 1e-6, as upstream itself does.
+- Repeated redo-starry passes. Upstream runs one redo-starry pass. A pass can leave new zero edges (a snap as above,
+  an exact-zero optimum, or a star re-optimisation that puts an internal child's time at 0), so the engine repeats
+  collapse + pass while any live internal non-cell node has t == 0, up to 8 passes; passes after the first run the
+  greedy only at the nodes the collapse gave children. Every merge raises the likelihood by more than 1e-6, so the
+  passes terminate; hitting the cap emits a `RuntimeWarning` and returns the (valid) tree with those zero edges. The
+  greedy-stage tree is written from a copy with zero edges collapsed, as upstream's `cleanup_tree` does (DP:354-355).
+- Redo-starry visiting order. Like upstream's recursion (children before their parent, TH:902-929, 968-1012), redo
+  starry visits the nodes in post-order, but it takes the children by increasing node id where upstream takes them
+  in its child-list order. That list is insertion order, and after `mergeZeroTimeChilds` the promoted grandchildren
+  are appended at its end (TH:806). The order matters beyond ties: upstream updates the parent's as-if-root message
+  after each child that changed (`getLtqsAfterChildUpdate`, TH:5353-5358), so the order decides which earlier
+  siblings' changes a later sibling's outside message already contains, and with it that sibling's merges. The
+  engine updates its messages in the same way: each node's outside message comes from its parent's float64 sums when
+  the traversal reaches it, and a finished child's contribution is replaced in those sums. The reference recomputes
+  every message from scratch instead; both agree in float64 and visit in the same order.
+- Lazy-greedy bounds on the parent's actual movement. Upstream bounds a stored pair score by its slopes times a
+  fixed ellipsoid size (`UB_ellipsoid_size`, TH:5118-5215). The engine applies the same slopes to how far the parent
+  has actually moved since the pair was scored: every merge or star re-optimisation adds
+  δx = ‖(x_new − x_old)·√W_old‖₂ and δW = ‖(W_new − W_old)/W_old‖₂ to running totals, and a pair scored at totals
+  (Dx_e, DW_e) has the bound d + a·(Dx − Dx_e) + b·(DW − DW_e). The bound is still a heuristic, not a proof. Any change
+  of a child's time, and every round when bounds are off (≤ 10 children), sets every bound to +inf, so those rounds
+  score every candidate. A fresh score equal to the largest stale bound is accepted; upstream stops its scan only when
+  the best score is strictly larger (TH:1257).
+- kNN candidates. As upstream, candidate pairs come from the k = 10 nearest neighbours while the parent has more than
+  50 children (TH:1888, 2115-2167) and from all pairs below. Differences: a new node's pairs come from an exact query
+  over the current children, where upstream queries a stale index for 20·k neighbours; the index is rebuilt after
+  max(⌊0.1·C⌋, 10) merges including the first time (upstream's first threshold has no floor of 10, TH:2355), after
+  every star re-optimisation (TH:1417), and once more before stopping (upstream stops, TH:1435-1451); upstream's
+  top-up of neighbours for sparsely paired nodes is not reproduced.
+- Several merges per round (opt-in). With `merges_per_round` m > 1 (default 1; root greedy only, never in redo
+  starry), a round merges the certified best pair plus up to m − 1 further pairs. These are freshly scored at the
+  same parent state, have dLogL > 1e-6, are disjoint from each other and from the best pair, and are taken by
+  decreasing dLogL with their stored times. Upstream merges one pair per round. The later pairs of a round are not
+  re-scored after the earlier merges, so this is a free-search approximation whose default is decided by the M2
+  gates.
+- Periodic star re-optimisation on any round. Upstream checks the 5% schedule only on rounds that did not use bounds
+  (TH:1926-1927); the engine checks it on every round.
+- Merge times. Upstream re-solves the chosen pair at tol 1e-9 before merging because it scores at tol 1e-4. The
+  engine merges with the times of the score itself: the device solve, converged to its own resolution, or the float64
+  host re-score for flagged pairs.
+- Host float64 weights. The parent's sums are float64 on the host. Each
+  child weight is recomputed there as 1/(v + t) from the stored compute-dtype message and the float64 time, so the
+  weight removed at a merge is bitwise the one added, without copying weights back from the device.
+- Near-threshold accept decisions in float32 are made in float64, one-sided. In float32 a pair's dLogL carries a
+  rounding error of order eps32·Σ|terms|, which on noisy data (cell variances ~1e6) exceeds the 1e-6 threshold: the
+  engine would merge pairs that float64 and upstream reject. Before a merge is accepted (including the extra pairs of
+  a `merges_per_round` round), a pair whose device score d satisfies d − 1e-6 ≤ its derived float32 resolution
+  (1.25 × the rounding bound of its two star log-likelihoods, the ¼ covering the inputs' cast to float32) is
+  re-scored on the host in float64, and the decision uses that score; if it is still the best over every bound, it is
+  merged. Only false accepts are guarded: a pair whose device d ≤ 1e-6 while its float64 d > 1e-6 is not re-scored, so
+  the engine can stop where float64 would merge once more. The M2 gate runs count such cases.
+- Star EM fallback start. When the star EM's fixed-point sweeps do not converge, upstream falls back to BFGS on log t
+  starting from log t (TH:5009), which is −inf for a child whose time was clamped to 0. The reference starts such
+  children at log 1e-4 (upstream's own floor elsewhere, TH:4823) instead; the device star EM hands every
+  non-converged star to that reference.

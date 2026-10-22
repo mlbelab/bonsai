@@ -175,8 +175,9 @@ def select_candidate(d, ub, fresh, ij, M: int) -> tuple[str, np.ndarray]:
     ``fresh`` (n,): scored at the current epoch; ``ij`` (n, 2) canonical pairs. The best eligible
     (fresh, finite d) candidate by (d desc, ij asc) is accepted once d ≥ every stale bound
     (equality accepts, A20). Otherwise ("rescore", the M stale candidates with the largest bound by
-    (ub desc, ij asc)); ("none", []) when nothing is eligible or stale.
+    (ub desc, ij asc)); ("none", []) when nothing is eligible or stale. A NaN bound counts as +inf (rescored first).
     """
+    ub = np.where(np.isnan(ub), np.inf, ub)
     stale = np.flatnonzero(~fresh)
     elig = np.flatnonzero(fresh & np.isfinite(d))
     if len(elig):  # O(n): the largest d, then the lowest (i, j) key among the rows tied at it

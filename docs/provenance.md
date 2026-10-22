@@ -29,3 +29,8 @@
   (passing `precision=jax.lax.Precision.HIGHEST` so float32 matmuls do not lower to TF32 on GPU) is
   the one used by the internal mlbelab project rose (`rose.core.numerics`); no licence constraint
   (internal).
+- `bonsai._ref.greedy`, `bonsai._engine.greedy` and `bonsai._engine.build`: re-implementations, in NumPy (fp64
+  reference) and JAX with host NumPy (engine), of upstream b16ef6f's greedy merge loop and redo starry, licence
+  CC BY-NC 4.0: `mergeChildrenRecursive` (TH:968-1012), `mergeChildrenUB` (TH:1039-1620),
+  `getOptimalDLogLPairInfoNew` and `mergeNodes` (TH:2381-2686) and `mergeZeroTimeChilds` (TH:789-807). Upstream's
+  code is not copied; the differences are listed in docs/deviations.md ("Phase 2 M2 greedy engine").
