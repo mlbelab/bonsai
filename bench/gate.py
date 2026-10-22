@@ -7,6 +7,11 @@ Both arms' redo-starry trees are re-timed by the same float64 re-timer (``bench.
 ``JAX_ENABLE_X64=1`` subprocess) on the same leaf arrays, then compared by A1 (re-timed L per
 entry) and, with a simulated truth, A7 (A15 quartets). Arms whose ``leaf_sha256`` or
 ``genes_used`` differ are refused. Any INVALID re-time makes the verdict ``"INVALID"``.
+
+A23: the gate never regenerates leaf data (the simulator's leaf arrays are not bit-identical across
+CPU SIMD targets). Both arms are scored on the upstream arm's own stored arrays (``load_leaf_arrays``,
+``leaf_arrays.npz`` for a bench run dir, or upstream's still-on-disk processed folder for a raw
+results folder); ``leaf_sha256`` stays a strict integrity check.
 """
 
 import argparse
@@ -21,7 +26,6 @@ import numpy as np
 
 from bonsai._engine.opt_times import T_SNAP
 from bonsai._ref.newick import parse_newick
-from bonsai._ref.preprocess import preprocess
 from bonsai._ref.tree import tree_loglik
 
 from . import metadata
@@ -66,13 +70,41 @@ def _unique(paths, what: str) -> Path:
     return paths[0]
 
 
-def load_arm(path: Path) -> dict:
-    """{"stage_newick", "leaf_sha256", "genes_used", "config"} of a bench run dir or upstream results folder."""
+def load_leaf_arrays(results_dir: Path) -> tuple[np.ndarray, np.ndarray, list, list]:
+    """(x, var, cells, genes) from a bench run dir's stored leaf arrays.
+
+    A23's ``<tag>_leaf_arrays.npz``, recorded as ``results.json``'s ``runs[0]["leaf_arrays"]``. Raises ``RuntimeError`` if the run predates A23: the workdir its leaf arrays came from is already
+    gone, so there is nothing left to score the gate on, and it must not be silently regenerated.
+    """
+    results_dir = Path(results_dir)
+    res = json.loads((results_dir / "results.json").read_text())
+    name = res["runs"][0].get("leaf_arrays")
+    if name is None:
+        raise RuntimeError(f"{results_dir}: baseline predates A23; rerun it")
+    with np.load(results_dir / name) as z:
+        return z["x"], z["var"], list(z["cells"]), list(z["genes"])
+
+
+def load_arm(path: Path, load_arrays: bool = True) -> dict:
+    """{"stage_newick", "leaf_sha256", "genes_used", "config"} of a bench run dir or upstream results folder, plus "x"/"var"/"cells"/"genes" when ``load_arrays``.
+
+    A bench run dir's ``x``/``var``/``cells``/``genes`` come from ``load_leaf_arrays`` (A23) and are
+    only read when ``load_arrays`` (default ``True``): the jax arm's own arrays are never used for
+    scoring (``gate()`` scores both arms on the upstream arm's arrays, loaded with ``load_arrays=True``),
+    so a jax bench run dir without a stored ``leaf_arrays.npz`` must not raise "baseline predates A23" —
+    only its recorded ``leaf_sha256``/``genes_used`` are checked against upstream's. A raw upstream
+    results folder (no ``results.json``) always has its processed arrays on disk and returns them
+    regardless of ``load_arrays``.
+    """
     path = Path(path)
     if (path / "results.json").exists():
         res = json.loads((path / "results.json").read_text())
         r = res["runs"][0]
-        return {k: r[k] for k in ("stage_newick", "leaf_sha256", "genes_used")} | {"config": res["config"]}
+        out = {k: r[k] for k in ("stage_newick", "leaf_sha256", "genes_used")} | {"config": res["config"]}
+        if load_arrays:
+            x, var, cells, genes = load_leaf_arrays(path)
+            out |= {"x": x, "var": var, "cells": cells, "genes": genes}
+        return out
     redo = _unique(path.glob("intermediate_bonsai*_redoStarry/tree.nwk"), "redo-starry tree")
     greedy = _unique(
         (p for p in path.iterdir() if p.is_dir() and _GREEDY_FOLDER.fullmatch(p.name)), "greedy-stage folder"
@@ -85,6 +117,10 @@ def load_arm(path: Path) -> dict:
         "leaf_sha256": leaf_sha256(x, var, meta["cellIds"]),
         "genes_used": list(meta["geneIds"]),
         "config": None,
+        "x": x,
+        "var": var,
+        "cells": meta["cellIds"],
+        "genes": list(meta["geneIds"]),
     }
 
 
@@ -105,22 +141,25 @@ def _arm_report(arm: dict, cells, x, var, truth, seed: int, device) -> tuple[dic
 
 
 def gate(jax_dir: Path, upstream: Path, device: str | None = None) -> dict:
-    """Gate report of one case; raises ``ValueError`` if the arms' leaf arrays differ."""
-    arms = {"jax": load_arm(jax_dir), "upstream": load_arm(upstream)}
+    """Gate report of one case; raises ``ValueError`` if the arms' leaf arrays differ.
+
+    A23: both arms are scored on the upstream arm's own stored leaf arrays, never on arrays
+    regenerated here (the simulator's leaf arrays are not bit-identical across CPU SIMD targets).
+    """
+    arms = {"jax": load_arm(jax_dir, load_arrays=False), "upstream": load_arm(upstream)}
     for key in ("leaf_sha256", "genes_used"):
         if arms["jax"][key] != arms["upstream"][key]:
             raise ValueError(f"arms differ in {key}: refusing to gate")
     cfg = arms["jax"]["config"]
     if cfg is None:
         raise ValueError(f"jax arm must be a bench run dir (with results.json), got {jax_dir}")
-    adata, truth = load_data(cfg)
-    jkw = cfg.get("jax", {})
-    leaves = preprocess(adata, jkw.get("zscore_cutoff", 1.0), jkw.get("rescale_by_var", True))
-    cells, genes = list(adata.obs_names), list(adata.var_names[leaves.genes])
-    if leaf_sha256(leaves.x, leaves.var, cells) != arms["jax"]["leaf_sha256"] or genes != arms["jax"]["genes_used"]:
-        raise ValueError("the gate's own leaf arrays differ from the arms'")
+    _, truth = load_data(cfg)
+    cells, genes = arms["upstream"]["cells"], arms["upstream"]["genes"]
+    x, var = arms["upstream"]["x"], arms["upstream"]["var"]
+    if leaf_sha256(x, var, cells) != arms["upstream"]["leaf_sha256"]:
+        raise ValueError("upstream's stored leaf arrays do not match its recorded leaf_sha256")
     seed = cfg["run"]["seed"]
-    both = {k: _arm_report(a, cells, leaves.x, leaves.var, truth, seed, device) for k, a in arms.items()}
+    both = {k: _arm_report(a, cells, x, var, truth, seed, device) for k, a in arms.items()}
     rep, rts = {k: r for k, (r, _) in both.items()}, {k: rt for k, (_, rt) in both.items()}
     q = {k: rep[k].get("quartet_accuracy") for k in rep}
     v = gate_verdict(rts["jax"].L, rts["upstream"].L, len(cells), len(genes), q["jax"], q["upstream"])

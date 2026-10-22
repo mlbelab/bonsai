@@ -54,24 +54,26 @@ def _quad_case(n, log10_kappa, seed, neg=False):
 def test_gap_estimate_on_quadratic():
     # (1) n = 30, well conditioned: the residual rule fires (‖r‖ ≤ 1e-6·‖pg‖); the gap error ½rᵀA⁻¹r is then
     # ≤ 1e-12·κ(A) relative (κ ≲ 1e2 here), far inside rel 1e-6.
+    # bound=0.0 throughout: disables the A16d plateau-acceptance alternative (0.1·bound = 0), so these
+    # cases exercise only the residual/curvature stop rules, unaffected by A16d.
     A, _, pg, scale, exact = _quad_case(30, 1, seed=0)
-    gap, it, ok, curv = remaining_gap(pg, np.ones(30, bool), lambda v: A @ v, scale)
+    gap, it, ok, curv = remaining_gap(pg, np.ones(30, bool), lambda v: A @ v, scale, 0.0)
     assert ok and not curv and it < 2000
     assert gap == pytest.approx(exact, rel=1e-6, abs=0)
     # (2) n = 300, Jacobi-scaled κ ≈ 1e5: converged by the pre-declared rule, within 1e-3 of the dense solve
     A, M, pg, scale, exact = _quad_case(300, 5, seed=1)
     assert 3e4 <= np.linalg.cond(M) <= 3e5
-    gap, it, ok, _ = remaining_gap(pg, np.ones(300, bool), lambda v: A @ v, scale)
+    gap, it, ok, _ = remaining_gap(pg, np.ones(300, bool), lambda v: A @ v, scale, 0.0)
     assert ok and it < 2000
     assert gap == pytest.approx(0.5 * pg @ np.linalg.solve(A, pg), rel=1e-3, abs=0)
     assert gap == pytest.approx(exact, rel=1e-3, abs=0)
     # (3) the same with max_cg = 20: cap hit -> not converged
-    gap, it, ok, _ = remaining_gap(pg, np.ones(300, bool), lambda v: A @ v, scale, max_cg=20)
+    gap, it, ok, _ = remaining_gap(pg, np.ones(300, bool), lambda v: A @ v, scale, 0.0, max_cg=20)
     assert not ok and it == 20
     # (4) one negative eigenvalue (pg has a component on it): curvature stop before the cap; without a
     # line search the estimate is not converged (the line-search path is test_negative_curvature_line_search)
     A, _, pg, scale, _ = _quad_case(30, 1, seed=2, neg=True)
-    gap, it, ok, curv = remaining_gap(pg, np.ones(30, bool), lambda v: A @ v, scale)
+    gap, it, ok, curv = remaining_gap(pg, np.ones(30, bool), lambda v: A @ v, scale, 0.0)
     assert curv and not ok and it < 2000
 
 
@@ -92,7 +94,7 @@ def test_gap_free_set_projection():
         seen.append(v[k])
         return A @ v
 
-    gap, _, ok, _ = remaining_gap(pg, free, hvp, scale)
+    gap, _, ok, _ = remaining_gap(pg, free, hvp, scale, 0.0)  # bound=0.0: not exercising A16d here
     f = np.flatnonzero(free)
     assert ok and set(seen) == {0.0}
     assert gap == pytest.approx(0.5 * pg[f] @ np.linalg.solve(A[np.ix_(f, f)], pg[f]), rel=1e-6, abs=0)
@@ -137,8 +139,8 @@ def test_negative_curvature_line_search(mu, valid):
     pg, h, L, best = _quartic_case(mu)
     s0 = np.zeros(6)
     gap, it, ok, curv = remaining_gap(
-        pg, np.ones(6, bool), lambda v: h * v, 1.0, line_search=lambda p: line_gain(L, s0, p)
-    )
+        pg, np.ones(6, bool), lambda v: h * v, 1.0, 0.0, line_search=lambda p: line_gain(L, s0, p)
+    )  # bound=0.0: the curvature stop fires on CG's first direction, before the A16d window clause is ever reached
     assert curv and ok and it == 1
     assert gap == pytest.approx(best, rel=1e-9, abs=0)
     assert (gap <= 0.1) == valid
@@ -159,32 +161,64 @@ def test_line_gain_respects_the_box():
     assert line_gain(lambda z: float(-(z[0] ** 2)), np.zeros(2), np.array([1.0, 0.0])) == 0.0  # at a maximum
 
 
-def test_gap_window_clause_needs_small_residual():
-    """The window rule also needs ‖r‖ ≤ 1e-3·‖pg‖. Diagonal H: a compact cluster (50 eigenvalues in
-    [1, 2], pg 1) holds almost all of the gap and is resolved early; 500 eigenvalues in [1e3, 1e5]
-    (pg 1) hold almost none of it but dominate the residual, which decays slowly. A plain CG run
-    (same algorithm, fp64) shows the gap-only window rule fires while ‖r‖ > 1e-3·‖pg‖; the stop must
-    come later, at ‖r‖ ≤ 1e-3·‖pg‖."""
+def _ill_conditioned_cg_run():
+    """Diagonal H: a compact cluster (50 eigenvalues in [1, 2], pg 1) holds almost all of the gap and
+    is resolved early; 500 eigenvalues in [1e3, 1e5] (pg 1) hold almost none of it but dominate the
+    residual, which decays slowly. Returns (lam, b, k, gaps, res): k is the first iteration where the
+    bare window rule (gap change ≤ 1e-3 relative over the last 50 iterations) is met, gaps/res are
+    1-indexed-by-iteration (gaps[0] = 0 before any step, res[i - 1] = ‖r‖ after iteration i)."""
     lam = np.r_[np.linspace(1, 2, 50), np.logspace(3, 5, 500)]
     b = np.ones(lam.size)
-    nb = np.linalg.norm(b)
     d, r, p, res, gaps = np.zeros_like(b), b.copy(), b.copy(), [], [0.0]
     for _ in range(600):
         Hp = lam * p
         a = (r @ r) / (p @ Hp)
         d, r_new = d + a * p, r - a * Hp
         p, r = r_new + (r_new @ r_new) / (r @ r) * p, r_new
-        res.append(np.linalg.norm(r))  # res[i - 1] = ‖r‖ after iteration i
+        res.append(np.linalg.norm(r))
         gaps.append(0.5 * b @ d)
     k = next(i for i in range(52, len(gaps)) if abs(gaps[i] - gaps[i - 50]) <= 1e-3 * gaps[i])
+    return lam, b, k, gaps, res
+
+
+def test_gap_window_clause_needs_small_residual():
+    """The window rule also needs ‖r‖ ≤ 1e-3·‖pg‖ when the gap is not yet small vs. the bound. The
+    gap-only window rule fires (at k) while ‖r‖ > 1e-3·‖pg‖; with bound = 100 the plateaued gap (≈17.4,
+    see test_gap_plateau_converges_below_point_one_bound) stays above 0.1·bound = 10, so the A16d
+    alternative cannot fire either and the stop must wait for the residual, exactly as before A16d."""
+    lam, b, k, gaps, res = _ill_conditioned_cg_run()
+    nb = np.linalg.norm(b)
     assert res[k - 1] > 1e-3 * nb  # the window clause decides here
-    gap, it, ok, _ = remaining_gap(b, np.ones(lam.size, bool), lambda v: lam * v, 1.0)
+    gap, it, ok, _ = remaining_gap(b, np.ones(lam.size, bool), lambda v: lam * v, 1.0, 100.0)
     assert ok and it > k and res[it - 1] <= 1e-3 * nb
     assert gap == pytest.approx(0.5 * np.sum(b**2 / lam), rel=1e-3, abs=0)
 
 
+def test_gap_plateau_converges_below_point_one_bound():
+    """A16d: with bound = 1000, 0.1·bound = 100 exceeds the plateaued gap (≈17.4) from the first window
+    check (k), so CG converges there without waiting for the residual (which only shrinks enough at a
+    much later iteration, see test_gap_window_clause_needs_small_residual). max_cg = k + 10 leaves no
+    room to reach the residual-only stop, so dropping the 0.1·bound alternative would leave this
+    uncoverged (mutant 1); asserting ``it`` stays near ``k`` and ``gap`` matches the converged value (not
+    an early, unstabilised one) catches accepting the plateau without the 50-iteration window (mutant 2)."""
+    lam, b, k, gaps, res = _ill_conditioned_cg_run()
+    exact = 0.5 * np.sum(b**2 / lam)
+    gap, it, ok, _ = remaining_gap(b, np.ones(lam.size, bool), lambda v: lam * v, 1.0, 1000.0, max_cg=k + 10)
+    assert ok and k <= it <= k + 10
+    assert gap == pytest.approx(exact, rel=1e-3, abs=0)
+
+
+def test_gap_plateau_above_point_one_bound_is_invalid_at_cap():
+    """A16d: with bound = 100, 0.1·bound = 10 is below the plateaued gap (≈17.4), so the alternative
+    never fires; capping max_cg before the residual stop (reached only well after k, see
+    test_gap_window_clause_needs_small_residual) leaves CG not converged."""
+    lam, b, k, gaps, res = _ill_conditioned_cg_run()
+    gap, it, ok, _ = remaining_gap(b, np.ones(lam.size, bool), lambda v: lam * v, 1.0, 100.0, max_cg=k + 14)
+    assert not ok and it == k + 14
+
+
 def test_remaining_gap_zero_gradient():
-    assert remaining_gap(np.zeros(3), np.ones(3, bool), lambda v: v, 1.0) == (0.0, 0, True, False)
+    assert remaining_gap(np.zeros(3), np.ones(3, bool), lambda v: v, 1.0, 0.0) == (0.0, 0, True, False)
 
 
 # --- retime on trees
@@ -252,18 +286,23 @@ def test_retime_other_scipy_status_is_invalid(monkeypatch):
 
 @pytest.mark.x64
 def test_cg_cap_scales_with_free_set(monkeypatch):
-    """A16c: CG cap = max(MAX_CG, n_free); with MAX_CG lowered below n_free the cap is n_free."""
+    """A16c: CG cap = max(MAX_CG, n_free); with MAX_CG lowered below n_free the cap is n_free.
+
+    Also checks ``retime`` passes its own A16 acceptance bound through to ``remaining_gap`` (a dropped
+    ``bound`` argument, e.g. a stray ``0.0``, would silently disable the A16d plateau alternative).
+    """
     seen = {}
     real = rt.remaining_gap
 
-    def spy(pg, free, hvp, scale, max_cg=rt.MAX_CG, line_search=None):
-        seen.update(max_cg=max_cg, n_free=int(free.sum()))
-        return real(pg, free, hvp, scale, max_cg, line_search)
+    def spy(pg, free, hvp, scale, bound, max_cg=rt.MAX_CG, line_search=None):
+        seen.update(max_cg=max_cg, n_free=int(free.sum()), bound=bound)
+        return real(pg, free, hvp, scale, bound, max_cg, line_search)
 
     monkeypatch.setattr(rt, "remaining_gap", spy)
     monkeypatch.setattr(rt, "MAX_CG", 10)
     retime(*_case(30, 50))
     assert seen["n_free"] > 10 and seen["max_cg"] == seen["n_free"]
+    assert seen["bound"] == _bound(30, 50)
 
 
 def _early_stops(monkeypatch, n_early, status=0):
@@ -402,7 +441,7 @@ def test_cg_gap_matches_dense_at_probe_point():
         return -nv * (lg(s + 1e-4 * v / nv)[1] - lg(s - 1e-4 * v / nv)[1]) / 2e-4
 
     scale = rt._grad_scale(parent, t, tree_loglik_grad(parent, t, x, var))
-    gap, it, ok, curv = remaining_gap(pg, free, hvp, scale)
+    gap, it, ok, curv = remaining_gap(pg, free, hvp, scale, 0.0)  # bound=0.0: checked against the dense solve, not A16d
     assert ok and not curv and it < 2000
     H, pg_free = _dense_fd_hessian(parent, t, x, var, free)
     assert gap == pytest.approx(0.5 * pg_free @ np.linalg.solve(H, pg_free), rel=1e-2, abs=0)

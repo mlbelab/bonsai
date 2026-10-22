@@ -209,6 +209,11 @@ def test_upstream_stop_after_redo_starry_smoke(tmp_path):
     assert not any(tmp_path.rglob("run0_workdir"))  # workdir removed after harvest
     assert "upstream_finalLoglik" not in r["loglik"] and len(r["genes_used"]) == r["n_genes_used"]
     assert r["leaf_sha256"] == run.leaf_sha256(*preprocessed_sorted(SMOKE_ADATA))  # same as the port's arrays
+    # A23: the processed leaf arrays travel with the baseline, saved before the workdir is removed.
+    assert r["leaf_arrays"] == "run0_leaf_arrays.npz"
+    with np.load(out / r["leaf_arrays"]) as z:
+        assert run.leaf_sha256(z["x"], z["var"], list(z["cells"])) == r["leaf_sha256"]
+        assert list(z["genes"]) == r["genes_used"]
 
 
 def test_leaf_arrays_maps_rows_by_cell_ids_not_obs_order():
@@ -331,3 +336,6 @@ def test_smoke_run_end_to_end(tmp_path):
     assert ll["per_entry"] == pytest.approx(ll["value"] / (24 * r["n_genes_used"]), rel=1e-15)
     assert 0.0 <= r["truth"]["quartet_accuracy"] <= 1.0 and 0.0 <= r["truth"]["rf_normalised"] <= 1.0
     assert meta["seed"] == 0
+    # A23: a full (non-stage-limited) run also saves its leaf arrays before the workdir is removed.
+    with np.load(out / r["leaf_arrays"]) as z:
+        assert run.leaf_sha256(z["x"], z["var"], list(z["cells"])) == r["leaf_sha256"]

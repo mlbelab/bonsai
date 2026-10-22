@@ -9,7 +9,8 @@ this module in such a subprocess). Acceptance:
   must be ≤ the bound (A16b, A16c). Any other status (e.g. NaN) is INVALID;
 - the estimated remaining gap on the free set by CG with central-FD Hessian-vector products
   (``remaining_gap``: Newton gap, or on non-positive curvature the CG model gain plus a measured
-  line-search gain) ≤ the bound. It is an estimate, not a rigorous bound;
+  line-search gain) ≤ the bound. CG also accepts a plateaued gap ≤ 0.1·bound without needing the
+  residual to shrink (A16d). It is an estimate, not a rigorous bound;
 - the engine's L agrees with ``_ref.tree`` to 1e-10 relative at the final times.
 
 The bound is 1e-2·(1e-6·N·G): each arm's error is ≤ 1% of the A1 slack. Anything else is INVALID.
@@ -37,6 +38,7 @@ FD_H = 1e-4  # step in s (along a unit direction) of the central-FD Hessian-vect
 L_MATCH_REL = 1e-10  # |L_engine64 − L_ref| / |L_ref| above this → INVALID
 GAP_FRAC = 1e-2  # bound = GAP_FRAC · 1e-6 · N · G (A1 slack per entry is 1e-6)
 CG_GAP_REL, CG_GAP_WINDOW, CG_RES_GAP, CG_RES = 1e-3, 50, 1e-3, 1e-6  # pre-declared CG stop rule
+CG_GAP_BOUND_FRAC = 0.1  # A16d: the window clause also accepts gap ≤ 0.1·bound, near the box floor's flat curvature
 CURV_REL = 1e-10  # pᵀHp ≤ CURV_REL·‖p‖²·scale: FD noise ≈ eps64·scale/h ≈ 2e-12·scale, ×50
 
 
@@ -102,6 +104,7 @@ def remaining_gap(
     free: np.ndarray,
     hvp: Callable[[np.ndarray], np.ndarray],
     scale: float,
+    bound: float,
     max_cg: int = MAX_CG,
     line_search: Callable[[np.ndarray], float] | None = None,
 ) -> tuple[float, int, bool, bool]:
@@ -109,8 +112,11 @@ def remaining_gap(
 
     CG on H·d = pg, H = −∇²L; the gap is ½·pgᵀd (the Newton gap, exact for a quadratic). ``hvp(v)``
     = H·v only ever sees vectors that are zero outside ``free``, and its output is projected to
-    ``free``. Converged when the gap changes ≤ 1e-3 relative over the last 50 iterations with
-    ‖r‖ ≤ 1e-3·‖pg‖, or ‖r‖ ≤ 1e-6·‖pg‖; not converged at the cap. On curvature
+    ``free``. Converged when the gap changes ≤ 1e-3 relative over the last 50 iterations AND either
+    ‖r‖ ≤ 1e-3·‖pg‖ (as before) or gap ≤ 0.1·``bound`` (A16d: near-floor edges can carry curvature
+    ~1e8 below the rest, so the residual alone may never shrink enough; once the plateaued gap is
+    already a small fraction of the acceptance bound the residual test is not required), or
+    ‖r‖ ≤ 1e-6·‖pg‖; not converged at the cap. On curvature
     pᵀHp ≤ 1e-10·‖p‖²·scale (A16b, Steihaug-style) CG stops: gap = the CG model gain so far plus
     ``line_search(p)``, the measured gain of an exact line search along ±p from the re-timed point,
     and the result counts as converged; without ``line_search`` it does not. Either way the gap
@@ -140,7 +146,7 @@ def remaining_gap(
         if (
             len(gaps) > CG_GAP_WINDOW + 1
             and abs(gaps[-1] - gaps[-1 - CG_GAP_WINDOW]) <= CG_GAP_REL * abs(gaps[-1])
-            and res <= CG_RES_GAP * nb
+            and (res <= CG_RES_GAP * nb or gaps[-1] <= CG_GAP_BOUND_FRAC * bound)
         ):
             return gaps[-1], it, True, False
         p = r + (rn / rr) * p
@@ -215,6 +221,7 @@ def retime(parent, t, x, var) -> RetimeResult:
         free,
         hvp,
         _grad_scale(parent, t_fin, R),
+        bound,
         max_cg=max(MAX_CG, int(free.sum())),
         line_search=lambda p: line_gain(ref_L, s, p),
     )

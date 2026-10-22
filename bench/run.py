@@ -9,6 +9,12 @@ log lines. Log-likelihoods follow amendment A1 (see ``LOGLIK_CONVENTION``).
 ``[run] stop_after = "redo_starry"`` (A22) stops the upstream run right after the redo-starry tree is
 stored, without touching ``_core``: a log handler raises once it sees ``STOP_MARKER``, and the
 harvested greedy/redo-starry stage trees are returned instead of a finished run.
+
+Before the workdir is removed, the run's processed leaf arrays (cells × genes float64 ``x``/``var``,
+cell names, ``genes_used``: exactly what ``leaf_sha256`` hashes) are saved as ``<tag>_leaf_arrays.npz``
+next to the other per-run output files and recorded as ``results.json``'s ``leaf_arrays`` (A23): the
+gate reads them from there instead of regenerating leaf data, which is not bit-identical across CPU
+SIMD targets.
 """
 
 import argparse
@@ -280,6 +286,10 @@ def run_upstream(
     ``upstream_finalLoglik`` (no final stage ran). Every result, stopped or not, carries
     ``"genes_used"`` and ``"leaf_sha256"``. Raises ``RuntimeError`` if ``stop_after`` is set but the
     run completed without ever hitting ``STOP_MARKER`` (never silently mislabel a full run).
+
+    With ``out``, the processed leaf arrays are also saved as ``<tag>_leaf_arrays.npz`` and recorded
+    as ``"leaf_arrays"`` in the returned dict (A23); without ``out`` there is no results folder to
+    save them into.
     """
     if stop_after is not None and stop_after not in _STOP_AFTER_VALUES:
         raise ValueError(f"stop_after must be one of {_STOP_AFTER_VALUES}, got {stop_after!r}")
@@ -384,6 +394,13 @@ def run_upstream(
             },
             "tree": (parent, names),
         }
+    if out is not None:
+        # A23: the simulator's leaf arrays are not bit-identical across CPU SIMD targets, so the gate
+        # must never regenerate them; save exactly what leaf_sha256 hashed, next to the workdir it came
+        # from, before that workdir (and the processed/ arrays inside it) is removed below.
+        leaf_arrays_name = f"{tag}_leaf_arrays.npz"
+        np.savez(out / leaf_arrays_name, x=x, var=var, cells=np.array(cell_ids), genes=np.array(result["genes_used"]))
+        result["leaf_arrays"] = leaf_arrays_name
     shutil.rmtree(wd, ignore_errors=True)  # only reached on success; a failure or kill leaves wd behind
     return result
 

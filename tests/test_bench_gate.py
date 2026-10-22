@@ -19,11 +19,26 @@ def test_gate_verdict():
     assert gate_verdict(0, 0, 10, 10)["a7_pass"] is None
 
 
-def _run_dir(path, cfg, newick, sha, genes):
+def _run_dir(path, cfg, newick, sha, genes, x=None, var=None, cells=None):
+    """A bench run dir (A23: always carries its ``leaf_arrays.npz``, as a real one would)."""
     path.mkdir()
-    run = {"stage_newick": {"greedy": newick, "redo_starry": newick}, "leaf_sha256": sha, "genes_used": genes}
+    if x is None:
+        x, var, cells = np.zeros((1, max(len(genes), 1))), np.ones((1, max(len(genes), 1))), ["c0"]
+    np.savez(path / "leaf_arrays.npz", x=x, var=var, cells=np.array(cells), genes=np.array(genes))
+    run = {
+        "stage_newick": {"greedy": newick, "redo_starry": newick},
+        "leaf_sha256": sha,
+        "genes_used": genes,
+        "leaf_arrays": "leaf_arrays.npz",
+    }
     (path / "results.json").write_text(json.dumps({"config": cfg, "runs": [run]}))
     return path
+
+
+def test_load_leaf_arrays_rejects_a_baseline_predating_a23(tmp_path):
+    (tmp_path / "results.json").write_text(json.dumps({"config": {}, "runs": [{"leaf_sha256": "h"}]}))
+    with pytest.raises(RuntimeError, match="predates A23"):
+        gate_mod.load_leaf_arrays(tmp_path)
 
 
 @pytest.mark.parametrize("field", ["leaf_sha256", "genes_used"])
@@ -62,16 +77,86 @@ def test_load_arm_from_upstream_results_folder(tmp_path):
 
 
 def _sim_arms(tmp_path):
-    """Both arms = the simulator's true tree (24 cells × 60 genes, seed 0) as bench run dirs."""
+    """Both arms = the simulator's true tree (24 cells × 60 genes, seed 0) as bench run dirs, each
+    carrying the same stored leaf arrays (A23: the gate reads these, not a fresh preprocess)."""
     cfg = {
         "run": {"name": "t", "seed": 0, "backend": "jax"},
         "data": {"kind": "simulate", "n_cells": 24, "n_genes": 60},
     }
     sim = simulate(seed=0, n_cells=24, n_genes=60)
     lv = preprocess(sim.adata)
-    sha, genes = leaf_sha256(lv.x, lv.var, list(sim.adata.obs_names)), list(sim.adata.var_names[lv.genes])
+    cells = list(sim.adata.obs_names)
+    sha, genes = leaf_sha256(lv.x, lv.var, cells), list(sim.adata.var_names[lv.genes])
     nwk = sim.adata.uns["bonsai_truth"]["newick"]
-    return _run_dir(tmp_path / "jax", cfg, nwk, sha, genes), _run_dir(tmp_path / "up", cfg, nwk, sha, genes), genes
+    a = _run_dir(tmp_path / "jax", cfg, nwk, sha, genes, lv.x, lv.var, cells)
+    b = _run_dir(tmp_path / "up", cfg, nwk, sha, genes, lv.x, lv.var, cells)
+    return a, b, genes
+
+
+def test_gate_refuses_arms_whose_leaf_arrays_differ_by_one_ulp(tmp_path, monkeypatch):
+    """A23: a 1-ulp difference between the arms' stored arrays flips leaf_sha256, so the mismatched-arms
+    check (not a fresh, SIMD-sensitive preprocess) refuses them."""
+    monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("re-timer reached"))
+    nwk, cfg = "((a:1,b:1):1,c:1);", {"run": {"seed": 0}}
+    rng = np.random.default_rng(0)
+    x, var = rng.normal(size=(3, 2)), rng.uniform(0.1, 1, size=(3, 2))
+    cells, genes = ["a", "b", "c"], ["g0", "g1"]
+    x_ulp = x.copy()
+    x_ulp[0, 0] = np.nextafter(x_ulp[0, 0], np.inf)
+    sha, sha_ulp = leaf_sha256(x, var, cells), leaf_sha256(x_ulp, var, cells)
+    assert sha != sha_ulp
+    a = _run_dir(tmp_path / "jax", cfg, nwk, sha, genes, x, var, cells)
+    b = _run_dir(tmp_path / "up", cfg, nwk, sha_ulp, genes, x_ulp, var, cells)
+    with pytest.raises(ValueError, match="leaf_sha256"):
+        gate_mod.gate(a, b)
+
+
+def test_gate_refuses_upstream_arm_whose_npz_does_not_match_its_recorded_hash(tmp_path, monkeypatch):
+    """A23 integrity check: both arms record the *same* leaf_sha256 (so the cross-arm check passes), but
+    upstream's own stored npz does not hash to it (a corrupted or stale npz) -> refused."""
+    monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("re-timer reached"))
+    monkeypatch.setattr(gate_mod, "load_data", lambda c: (None, None))  # cfg has no [data]; truth not needed here
+    nwk, cfg = "((a:1,b:1):1,c:1);", {"run": {"seed": 0}}
+    rng = np.random.default_rng(0)
+    x, var = rng.normal(size=(3, 2)), rng.uniform(0.1, 1, size=(3, 2))
+    cells, genes = ["a", "b", "c"], ["g0", "g1"]
+    sha = leaf_sha256(x, var, cells)  # both arms claim this hash
+    x_bad = x.copy()
+    x_bad[0, 0] = np.nextafter(x_bad[0, 0], np.inf)  # upstream's actual npz no longer matches it
+    a = _run_dir(tmp_path / "jax", cfg, nwk, sha, genes, x, var, cells)
+    b = _run_dir(tmp_path / "up", cfg, nwk, sha, genes, x_bad, var, cells)
+    with pytest.raises(ValueError, match="stored leaf arrays"):
+        gate_mod.gate(a, b)
+
+
+def test_gate_jax_arm_without_leaf_arrays_is_not_rejected_as_predating_a23(tmp_path, monkeypatch):
+    """A future jax bench run dir never carries leaf_arrays.npz (its arrays are never used for scoring);
+    load_arm(..., load_arrays=False) must not try to load it, so a missing npz there is not an error."""
+    nwk, cfg = "((a:1,b:1):1,c:1);", {"run": {"seed": 0}}
+    rng = np.random.default_rng(0)
+    x, var = rng.normal(size=(3, 2)), rng.uniform(0.1, 1, size=(3, 2))
+    cells, genes = ["a", "b", "c"], ["g0", "g1"]
+    sha = leaf_sha256(x, var, cells)
+    jax_dir = tmp_path / "jax"
+    jax_dir.mkdir()
+    run = {"stage_newick": {"greedy": nwk, "redo_starry": nwk}, "leaf_sha256": sha, "genes_used": genes}
+    (jax_dir / "results.json").write_text(json.dumps({"config": cfg, "runs": [run]}))  # no "leaf_arrays"
+    up = _run_dir(tmp_path / "up", cfg, nwk, sha, genes, x, var, cells)
+    monkeypatch.setattr(gate_mod, "load_data", lambda c: (None, None))  # cfg has no [data]; truth not needed here
+    monkeypatch.setattr(
+        gate_mod,
+        "retime_subprocess",
+        lambda parent, t, x, var, device=None: RetimeResult(
+            t, 0.0, 0.0, 0.0, 0.0, 0.0, 1, True, False, 1, 0, "converged", ""
+        ),
+    )
+    gate_mod.gate(jax_dir, up)  # must not raise "baseline predates A23" for the jax arm
+
+
+def test_load_arm_npz_genes_match_recorded_genes_used(tmp_path):
+    a = _run_dir(tmp_path / "up", {}, "(a:1,b:1,c:1);", "sha", ["g0", "g1"], np.zeros((1, 2)), np.ones((1, 2)), ["c0"])
+    arm = load_arm(a)
+    assert arm["genes"] == arm["genes_used"] == ["g0", "g1"]
 
 
 @pytest.mark.slow
@@ -130,6 +215,10 @@ def test_gate_rejects_upstream_folder_as_jax_arm(tmp_path, monkeypatch):
     """An upstream results folder has no config (load_arm gives config None): refused as the jax arm."""
     a, b, _ = _sim_arms(tmp_path)
     real = gate_mod.load_arm
-    monkeypatch.setattr(gate_mod, "load_arm", lambda path: real(path) | ({"config": None} if path == a else {}))
+    monkeypatch.setattr(
+        gate_mod,
+        "load_arm",
+        lambda path, load_arrays=True: real(path, load_arrays) | ({"config": None} if path == a else {}),
+    )
     with pytest.raises(ValueError, match="jax arm must be a bench run dir"):
         gate_mod.gate(a, b)
