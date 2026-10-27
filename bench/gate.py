@@ -1,7 +1,12 @@
 """M2 quality gate (A1, A7 after redo starry; A15, A16).
 
 ``python -m bench.gate --jax JAX_RUN_DIR --upstream (UPSTREAM_RUN_DIR | UPSTREAM_RESULTS_FOLDER) --out FILE
-[--device IDX]``
+[--device IDX] [--retime-cache DIR]``, or ``--upstream-only`` (no ``--jax``; re-times just the upstream arm
+into the cache, ``--retime-cache`` required).
+
+``--retime-cache DIR`` stores each ``RetimeResult`` under a sha256 of the tree, ``leaf_sha256`` and the
+``bench.retime`` constants, so an identical tree is re-timed once across runs; writes are atomic
+(concurrent array tasks may duplicate work, never corrupt an entry).
 
 Both arms' redo-starry trees are re-timed by the same float64 re-timer (``bench.retime``, in a
 ``JAX_ENABLE_X64=1`` subprocess) on the same leaf arrays, then compared by A1 (re-timed L per
@@ -15,20 +20,26 @@ results folder); ``leaf_sha256`` stays a strict integrity check.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
-from bonsai._engine.opt_times import T_SNAP
+from bonsai._engine import array_tree, numerics
+from bonsai._engine import tree as engine_tree
+from bonsai._engine.opt_times import LOG_T_MAX, LOG_T_MIN, T_SNAP
+from bonsai._ref import newick as ref_newick
+from bonsai._ref import tree as ref_tree
 from bonsai._ref.newick import parse_newick
 from bonsai._ref.tree import tree_loglik
 
-from . import metadata
+from . import metadata, retime
 from .metrics import contract_zero_edges, quartet_accuracy, rf_distance
 from .retime import RetimeResult, load
 from .run import _GREEDY_FOLDER, _leaf_arrays, _write_json, leaf_sha256, load_data
@@ -61,6 +72,72 @@ def retime_subprocess(parent, t, x, var, device: str | None = None) -> RetimeRes
             [sys.executable, "-m", "bench.retime", str(inp), str(out)], cwd=metadata.REPO, env=env, check=True
         )
         return load(out)
+
+
+_KEY_CONSTANTS = (
+    "OPTIONS", "MAX_RESTARTS", "MAX_CG", "FD_H", "L_MATCH_REL", "GAP_FRAC",
+    "CG_GAP_REL", "CG_GAP_WINDOW", "CG_RES_GAP", "CG_RES", "CG_GAP_BOUND_FRAC", "CURV_REL",
+)  # fmt: skip
+
+
+def code_hash() -> str:
+    """sha256 of the source of everything that computes a re-time.
+
+    That is retime, the engine tree pass with its numerics and layout, and the reference tree with its newick
+    helpers; scipy and jax versions are pinned by uv.lock.
+    """
+    h = hashlib.sha256()
+    for mod in (retime, engine_tree, numerics, array_tree, ref_tree, ref_newick):
+        h.update(Path(mod.__file__).read_bytes())
+    return h.hexdigest()
+
+
+def retime_key(parent, t, names, leaf_sha: str) -> str:
+    """sha256 of what determines a re-time.
+
+    The tree (t at full precision), the leaf data, the retime constants and box bounds, and the code hash.
+    """
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(parent, dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(t, dtype=np.float64).tobytes())
+    consts = {k: getattr(retime, k) for k in _KEY_CONSTANTS} | {"LOG_T_MIN": LOG_T_MIN, "LOG_T_MAX": LOG_T_MAX}
+    h.update(json.dumps([list(names), leaf_sha, consts, code_hash()], sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _load_entry(f: Path, code: str) -> RetimeResult | None:
+    """The cached result, or ``None`` (a miss).
+
+    A miss if the stored code hash differs or the result is not converged (A17: an INVALID is re-run, A16e).
+    """
+    with np.load(f) as z:
+        if "code_hash" not in z.files or z["code_hash"].item() != code:
+            return None
+        rt = RetimeResult(**{k: z[k] if k == "t" else z[k].item() for k in z.files if k != "code_hash"})
+    return rt if rt.status == "converged" else None
+
+
+def retime_cached(
+    parent, t, names, leaf_sha, x, var, device, cache_dir
+) -> tuple[RetimeResult, bool | None, str | None]:
+    """(result, cache hit, key).
+
+    Without ``cache_dir`` always re-times (hit and key ``None``). Only converged results are stored or served.
+    """
+    if cache_dir is None:
+        return retime_subprocess(parent, t, x, var, device), None, None
+    key = retime_key(parent, t, names, leaf_sha)
+    f = Path(cache_dir) / f"{key}.npz"
+    code = code_hash()
+    if f.exists() and (hit := _load_entry(f, code)) is not None:
+        return hit, True, key
+    rt = retime_subprocess(parent, t, x, var, device)
+    if rt.status == "converged":
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f"{key}.{os.getpid()}.{os.urandom(4).hex()}.tmp.npz")  # np.savez needs the .npz suffix
+        np.savez(tmp, **asdict(rt), code_hash=code)
+        os.replace(tmp, f)
+    return rt, False, key
 
 
 def _unique(paths, what: str) -> Path:
@@ -124,13 +201,18 @@ def load_arm(path: Path, load_arrays: bool = True) -> dict:
     }
 
 
-def _arm_report(arm: dict, cells, x, var, truth, seed: int, device) -> tuple[dict, RetimeResult]:
+def _arm_report(arm: dict, cells, x, var, truth, seed: int, device, cache_dir=None) -> tuple[dict, RetimeResult]:
     stages = {k: parse_newick(v) for k, v in arm["stage_newick"].items()}
     L_raw = {k: tree_loglik(p, t, *_leaf_arrays(p, nm, cells, x, var)) for k, (p, t, nm) in stages.items()}
     p, t, nm = stages["redo_starry"]
     X, V = _leaf_arrays(p, nm, cells, x, var)
-    rt = retime_subprocess(p, t, X, V, device)
-    out = {"L_raw_stage": L_raw, "retime": {k: v for k, v in rt.__dict__.items() if k != "t"}}
+    rt, hit, key = retime_cached(p, t, nm, arm["leaf_sha256"], X, V, device, cache_dir)
+    out = {
+        "L_raw_stage": L_raw,
+        "retime": {k: v for k, v in rt.__dict__.items() if k != "t"},
+        "retime_cache_hit": hit,
+        "retime_cache_key": key,
+    }
     if truth is not None:
         pc, _, nc = contract_zero_edges(p, rt.t, nm, snap=T_SNAP)
         out["quartet_accuracy"], out["n_quartets"] = quartet_accuracy(truth, (pc, nc), seed=seed)
@@ -140,7 +222,7 @@ def _arm_report(arm: dict, cells, x, var, truth, seed: int, device) -> tuple[dic
     return out, rt
 
 
-def gate(jax_dir: Path, upstream: Path, device: str | None = None) -> dict:
+def gate(jax_dir: Path, upstream: Path, device: str | None = None, cache_dir=None) -> dict:
     """Gate report of one case; raises ``ValueError`` if the arms' leaf arrays differ.
 
     A23: both arms are scored on the upstream arm's own stored leaf arrays, never on arrays
@@ -159,7 +241,7 @@ def gate(jax_dir: Path, upstream: Path, device: str | None = None) -> dict:
     if leaf_sha256(x, var, cells) != arms["upstream"]["leaf_sha256"]:
         raise ValueError("upstream's stored leaf arrays do not match its recorded leaf_sha256")
     seed = 0 if cfg is None else cfg["run"]["seed"]
-    both = {k: _arm_report(a, cells, x, var, truth, seed, device) for k, a in arms.items()}
+    both = {k: _arm_report(a, cells, x, var, truth, seed, device, cache_dir) for k, a in arms.items()}
     rep, rts = {k: r for k, (r, _) in both.items()}, {k: rt for k, (_, rt) in both.items()}
     q = {k: rep[k].get("quartet_accuracy") for k in rep}
     v = gate_verdict(rts["jax"].L, rts["upstream"].L, len(cells), len(genes), q["jax"], q["upstream"])
@@ -175,15 +257,34 @@ def gate(jax_dir: Path, upstream: Path, device: str | None = None) -> dict:
     } | v
 
 
+def gate_upstream_only(upstream: Path, device: str | None, cache_dir) -> dict:
+    """Re-time just the upstream arm into the cache (no jax arm, no truth); same integrity check as ``gate``."""
+    arm = load_arm(upstream)
+    if leaf_sha256(arm["x"], arm["var"], arm["cells"]) != arm["leaf_sha256"]:
+        raise ValueError("upstream's stored leaf arrays do not match its recorded leaf_sha256")
+    rep, rt = _arm_report(arm, arm["cells"], arm["x"], arm["var"], None, 0, device, cache_dir)
+    return {"upstream": str(upstream), "status": rt.status, "arm": rep}
+
+
 def main(argv: list[str] | None = None) -> Path:
     """Gate one case; write the report to ``--out`` and return its path."""
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--jax", required=True, type=Path)
+    ap.add_argument("--jax", type=Path)
     ap.add_argument("--upstream", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--retime-cache", type=Path, default=None, help="opt-in re-time cache directory")
+    ap.add_argument("--upstream-only", action="store_true", help="re-time only the upstream arm into the cache")
     args = ap.parse_args(argv)
-    _write_json(args.out, gate(args.jax, args.upstream, args.device))
+    if args.upstream_only:
+        if args.retime_cache is None or args.jax is not None:
+            ap.error("--upstream-only needs --retime-cache and no --jax")
+        report = gate_upstream_only(args.upstream, args.device, args.retime_cache)
+    elif args.jax is None:
+        ap.error("--jax is required unless --upstream-only")
+    else:
+        report = gate(args.jax, args.upstream, args.device, args.retime_cache)
+    _write_json(args.out, report)
     return args.out
 
 

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -240,3 +241,142 @@ def test_gate_truth_comes_from_the_upstream_arms_config(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="stop"):
         gate_mod.gate(a, b)
     assert seen[0]["run"]["seed"] == 0 and seen[0]["data"]["n_cells"] == 24
+
+
+def _stub(monkeypatch, calls, status="converged"):
+    def fake(parent, t, x, var, device=None):
+        calls.append(1)
+        return RetimeResult(np.array(t, float), -1.0, -2.0, 0.0, 0.0, 0.0, 1, True, False, 1, 0, status, "")
+
+    monkeypatch.setattr(gate_mod, "retime_subprocess", fake)
+
+
+def test_retime_cache_hit_returns_stored_result_without_subprocess(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls)
+    par, t, nm, xx = np.array([-1, 0, 0]), np.array([0.0, 0.1, 0.2]), ["r", "a", "b"], np.zeros((2, 1))
+    r1, hit1, key = gate_mod.retime_cached(par, t, nm, "h", xx, xx, None, tmp_path)
+    monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("subprocess spawned on a hit"))
+    r2, hit2, key2 = gate_mod.retime_cached(par, t, nm, "h", xx, xx, None, tmp_path)
+    assert (hit1, hit2, key2) == (False, True, key) and len(calls) == 1
+    assert r2.__dict__.keys() == r1.__dict__.keys()
+    for k, v in r1.__dict__.items():
+        np.testing.assert_array_equal(getattr(r2, k), v)
+    assert [p.name for p in tmp_path.iterdir()] == [f"{key}.npz"]  # no temp files left behind
+
+
+def test_retime_cache_off_by_default(monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls)
+    xx = np.zeros((2, 1))
+    out = gate_mod.retime_cached(np.array([-1, 0]), np.zeros(2), ["r", "a"], "h", xx, xx, None, None)
+    assert out[1:] == (None, None) and len(calls) == 1
+
+
+def test_retime_cache_key_misses(tmp_path, monkeypatch):
+    base = (np.array([-1, 0, 0]), np.array([0.0, 0.1, 0.2]), ["r", "a", "b"], "h")
+    k = gate_mod.retime_key(*base)
+    assert gate_mod.retime_key(base[0], np.nextafter(base[1], 1.0), base[2], "h") != k  # t at full precision
+    assert gate_mod.retime_key(*base[:3], "h2") != k  # leaf hash
+    assert gate_mod.retime_key(base[0], base[1], ["r", "b", "a"], "h") != k  # leaf names
+    assert gate_mod.retime_key(np.array([-1, 0, 1]), *base[1:]) != k  # topology
+    monkeypatch.setattr(gate_mod.retime, "GAP_FRAC", 2e-2)  # a retime constant
+    assert gate_mod.retime_key(*base) != k
+
+
+def test_gate_reports_cache_hits_and_reuses_identical_arms(tmp_path, monkeypatch):
+    """Both arms are the same tree: the second arm is a hit, and a rerun hits for both."""
+    a, b, _ = _sim_arms(tmp_path)
+    calls = []
+    _stub(monkeypatch, calls)
+    c = tmp_path / "cache"
+    g1 = gate_mod.gate(a, b, cache_dir=c)
+    assert [g1["arms"][k]["retime_cache_hit"] for k in ("jax", "upstream")] == [False, True] and len(calls) == 1
+    g2 = gate_mod.gate(a, b, cache_dir=c)
+    assert [g2["arms"][k]["retime_cache_hit"] for k in ("jax", "upstream")] == [True, True] and len(calls) == 1
+    assert gate_mod.gate(a, b)["arms"]["jax"]["retime_cache_hit"] is None
+
+
+def test_upstream_only_fills_the_cache_for_the_later_gate(tmp_path, monkeypatch):
+    a, b, _ = _sim_arms(tmp_path)
+    calls = []
+    _stub(monkeypatch, calls)
+    c, out = tmp_path / "cache", tmp_path / "u.json"
+    main(["--upstream", str(b), "--upstream-only", "--retime-cache", str(c), "--out", str(out)])
+    rep = json.loads(out.read_text())
+    assert rep["status"] == "converged" and rep["arm"]["retime_cache_hit"] is False and len(calls) == 1
+    assert gate_mod.gate(a, b, cache_dir=c)["arms"]["upstream"]["retime_cache_hit"] is True
+    with pytest.raises(SystemExit):
+        main(["--upstream", str(b), "--upstream-only", "--out", str(out)])  # needs a cache
+
+
+_TREE = (np.array([-1, 0, 0]), np.array([0.0, 0.1, 0.2]), ["r", "a", "b"], "h")
+
+
+def test_code_hash_covers_retime_and_both_trees(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    names = ("retime", "engine_tree", "numerics", "array_tree", "ref_tree", "ref_newick")
+    real = [Path(getattr(gate_mod, n).__file__).as_posix().split("/")[-3:] for n in names]
+    assert real[0][-1] == "retime.py" and real[1:] == [
+        ["bonsai", "_engine", "tree.py"],
+        ["bonsai", "_engine", "numerics.py"],
+        ["bonsai", "_engine", "array_tree.py"],
+        ["bonsai", "_ref", "tree.py"],
+        ["bonsai", "_ref", "newick.py"],
+    ]
+    files = [tmp_path / f"{n}.py" for n in names]
+    for f in files:
+        f.write_text("x = 1\n")
+    for name, f in zip(names, files, strict=True):
+        monkeypatch.setattr(gate_mod, name, SimpleNamespace(__file__=str(f)))
+    h0 = gate_mod.code_hash()
+    for f in files:
+        f.write_text(f.read_text() + "# edit\n")
+        h1 = gate_mod.code_hash()
+        assert h1 != h0
+        h0 = h1
+
+
+def test_retime_cache_key_misses_on_code_hash_and_time_box(monkeypatch):
+    k = gate_mod.retime_key(*_TREE)
+    monkeypatch.setattr(gate_mod, "code_hash", lambda: "other")
+    assert gate_mod.retime_key(*_TREE) != k
+    monkeypatch.undo()
+    monkeypatch.setattr(gate_mod, "LOG_T_MIN", gate_mod.LOG_T_MIN - 1.0)
+    assert gate_mod.retime_key(*_TREE) != k
+    monkeypatch.undo()
+    monkeypatch.setattr(gate_mod, "LOG_T_MAX", gate_mod.LOG_T_MAX + 1.0)
+    assert gate_mod.retime_key(*_TREE) != k
+
+
+def test_retime_cache_entry_with_another_code_hash_is_a_miss(tmp_path, monkeypatch):
+    """Belt and braces: an entry under the right key whose stored code hash differs is recomputed."""
+    calls = []
+    _stub(monkeypatch, calls)
+    xx = np.zeros((2, 1))
+    gate_mod.retime_cached(*_TREE, xx, xx, None, tmp_path)
+    (f,) = tmp_path.iterdir()
+    with np.load(f) as z:
+        d = {k: z[k] for k in z.files} | {"code_hash": np.array("stale")}
+    np.savez(f, **d)
+    assert gate_mod.retime_cached(*_TREE, xx, xx, None, tmp_path)[1] is False and len(calls) == 2
+
+
+def test_retime_cache_never_stores_or_serves_a_non_converged_result(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, status="invalid")
+    xx = np.zeros((2, 1))
+    for i in (1, 2):  # an INVALID is re-run (A17, A16e), not cached
+        assert gate_mod.retime_cached(*_TREE, xx, xx, None, tmp_path)[1:2] == (False,) and len(calls) == i
+    assert not list(tmp_path.glob("*.npz"))
+    # an invalid entry already on disk (e.g. written by an older version) is not served either
+    key = gate_mod.retime_key(*_TREE)
+    from dataclasses import asdict
+
+    bad = RetimeResult(np.zeros(3), -1.0, -2.0, 0.0, 0.0, 0.0, 1, True, False, 1, 0, "invalid", "x")
+    np.savez(tmp_path / f"{key}.npz", **asdict(bad), code_hash=gate_mod.code_hash())
+    _stub(monkeypatch, calls, status="converged")
+    rt, hit, _ = gate_mod.retime_cached(*_TREE, xx, xx, None, tmp_path)
+    assert hit is False and rt.status == "converged" and len(calls) == 3
+    assert gate_mod.retime_cached(*_TREE, xx, xx, None, tmp_path)[1] is True  # the converged result replaced it
