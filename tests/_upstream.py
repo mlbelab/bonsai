@@ -109,8 +109,10 @@ def upstream_merge_children(x, var, t, mode: str = "sequential") -> list[tuple[s
     ``x``, ``var``: (C, G) leaves (cells), ``t``: (C,) their times. Returns, per decision,
     ("merge" | "reopt" | "reset", leaf ids under child 1, under child 2); empty sets for "reopt".
     Recorded by wrapping ``TreeNode.mergeNodes``, ``optimiseConnected`` and ``resetChildTimes`` (test
-    side; ``_core`` untouched). With C ≤ 10 upstream uses neither bounds nor kNN (``nChildUB``,
-    ``nChildNN``), so every round scores all pairs.
+    side; ``_core`` untouched), in call order: an add-as-child merge is followed by the merges of its recursive
+    special-child greedy (``mergeDownstream=True`` as in upstream's root greedy, MA:177-180; TH:2637-2641), which
+    run inside it. With C ≤ 10 upstream uses neither bounds nor kNN (``nChildUB``, ``nChildNN``), so every round
+    scores all pairs.
     """
     C, G = x.shape
     decisions: list[tuple[str, frozenset, frozenset]] = []
@@ -149,7 +151,7 @@ def upstream_merge_children(x, var, t, mode: str = "sequential") -> list[tuple[s
             ellipsoidSize=1.0,
             nChildNN=50,
             kNN=10,
-            mergeDownstream=False,
+            mergeDownstream=True,
             singleProcess=True,
         )
     finally:

@@ -29,8 +29,10 @@ def _leaves(n: int, seed: int):
 
 
 def _run(x, var, cfg, mp=None, outside=None, dtype=jnp.float32):
-    """Engine from fp64 star times. With a ``MonkeyPatch`` ``mp``, every ``select_candidate`` call is logged with a
-    snapshot of the candidate store and the current children, and every kNN build with its valid-row count."""
+    """Engine from fp64 star times. With a ``MonkeyPatch`` ``mp``, every ``select_candidate`` call of the root's own
+    rounds is logged with a snapshot of the candidate store and the current children, and every kNN build with its
+    valid-row count. The returned trace holds the root's own rounds (counter ≥ 0): special-child greedies (A18b) have
+    their own store, run exhaustively (bounds and kNN off) and count as part of the merge that triggered them."""
     n = len(x)
     table = NodeTable(x, var, dtype=dtype)
     table.t[:n] = star_em(x, var, tol=cfg.star_tol)[0]
@@ -46,10 +48,11 @@ def _run(x, var, cfg, mp=None, outside=None, dtype=jnp.float32):
         real_sel, real_knn = eg.select_candidate, eg.knn
 
         def sel(d, ub, fresh, ij, M):
-            st = log["stores"][-1]
-            snap = {k: getattr(st, k).copy() for k in ("a", "b", "epoch", "Dx", "DW")}
-            snap |= {"d": d.copy(), "ub": ub.copy(), "fresh": fresh.copy(), "ij": ij.copy()}
-            log["calls"].append(snap | {"kids": table.children(n), "round": len(trace)})
+            st = log["stores"][0]  # the root's store; certify passes its d array itself
+            if d is st.d:
+                snap = {k: getattr(st, k).copy() for k in ("a", "b", "epoch", "Dx", "DW")}
+                snap |= {"d": d.copy(), "ub": ub.copy(), "fresh": fresh.copy(), "ij": ij.copy()}
+                log["calls"].append(snap | {"kids": table.children(n), "round": sum(e[4] >= 0 for e in trace)})
             return real_sel(d, ub, fresh, ij, M)
 
         def knn(points, k, valid):
@@ -60,11 +63,11 @@ def _run(x, var, cfg, mp=None, outside=None, dtype=jnp.float32):
         mp.setattr(eg, "select_candidate", sel)
         mp.setattr(eg, "knn", knn)
     stats = greedy_star(table, n, outside, outside is None, cfg, trace=trace)
-    return stats, trace, table, log
+    return stats, [e for e in trace if e[4] >= 0], table, log
 
 
 def _key(e):
-    return (e.kind, e.i, e.j, e.new)
+    return (e.kind, e.i, e.j, e.new, e.depth)
 
 
 @pytest.fixture(scope="module")
@@ -326,7 +329,7 @@ def test_merges_per_round_disjoint(lazy24, m):
     stats, trace, table, _ = _run(x, var, GreedyConfig(knn=False, merges_per_round=m))
     assert _key(stats.events[0]) == _key(lazy24[0].events[0])
     assert len(table.children(24)) == 3
-    ev = iter(stats.events)
+    ev = iter([e for e in stats.events if e.depth == 0])  # the root's own merges (A18b)
     multi = 0
     for k, (scores, tk, *_) in enumerate(trace):
         C_next = len(trace[k + 1][1]) if k + 1 < len(trace) else 3
@@ -389,7 +392,8 @@ def test_compiles_bounded_across_buckets(monkeypatch):
     star_buckets = {_bucket(len(e[1])) for e in trace if not e[0]}
     assert len(knn_buckets) >= 2 and len(star_buckets) >= 2  # buckets crossed
     caches = {  # kernel: (jitted function, shape buckets it sees)
-        "pair_score": (eg.pair_score, 2),  # rescore_top and new_batch rows
+        # rescore_top and new_batch rows, plus SPECIAL_BATCH rows when a special-child greedy ran (A18b)
+        "pair_score": (eg.pair_score, 2 + any(e.depth for e in stats.events)),
         "star_em": (eg.star_em, len(star_buckets)),
         "knn": (knn_mod._knn, len(knn_buckets)),
         "knn_query": (knn_mod._knn_query, len(knn_buckets)),

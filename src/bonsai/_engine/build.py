@@ -19,7 +19,7 @@ from bonsai._ref import star as ref_star
 from bonsai._ref.newick import to_newick
 
 from .array_tree import _bucket
-from .greedy import STAR_MAX_SWEEPS, ZERO_EDGE_PASSES, GreedyConfig, GreedyStats, NodeTable, greedy_star
+from .greedy import STAR_MAX_SWEEPS, GreedyConfig, GreedyStats, NodeTable, greedy_star, max_passes
 from .host_acc import ParentAcc
 from .star import star_em
 
@@ -148,20 +148,22 @@ def redo_starry(table: NodeTable, root: int, cfg: GreedyConfig) -> dict:
     """Redo starry (MA:225-237; ``mergeChildrenRecursive``, TH:968-1012; A18) on ``table`` in place, m = 1.
 
     A pass: ``collapse_zero_edges``, then ``_redo_pass`` (the first at every node, later ones only at the nodes the
-    collapse gave children). Passes repeat while a live internal non-cell node has t == 0, at most
-    ``ZERO_EDGE_PASSES``; reaching the cap warns (``RuntimeWarning``) and returns the tree as is (valid, with those
+    collapse gave children). Passes repeat while a live internal non-cell node has t == 0 (snaps are resolved inside
+    ``greedy_star``, A18b, so these come from exact-zero optima or star re-optimisations), at most
+    ``max_passes(N)`` = N − 1; reaching the cap warns (``RuntimeWarning``) and returns the tree as is (valid, with those
     zero edges). Returns the GreedyStats totals plus "passes" and "zero_edges_collapsed".
     """
     cfg = dataclasses.replace(cfg, merges_per_round=1)
     stats: list[GreedyStats] = []
     removed0 = int(np.sum(table.parent[: table.n] == -2))
-    for n_pass in range(1, ZERO_EDGE_PASSES + 1):
+    cap = max_passes(int(table.is_cell[: table.n].sum()))
+    for n_pass in range(1, cap + 1):
         gained = collapse_zero_edges(table, root)
         stats += _redo_pass(table, root, None if n_pass == 1 else set(gained), cfg)
         if not _zero_edge(table):
             break
     else:
-        warnings.warn(f"redo_starry: zero edges remain after {ZERO_EDGE_PASSES} passes", RuntimeWarning, stacklevel=2)
+        warnings.warn(f"redo_starry: zero edges remain after {cap} passes", RuntimeWarning, stacklevel=2)
     removed = int(np.sum(table.parent[: table.n] == -2)) - removed0
     return _totals(stats) | {"passes": n_pass, "zero_edges_collapsed": removed}
 

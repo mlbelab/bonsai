@@ -3,9 +3,10 @@
 Re-implements the semantics of upstream b16ef6f's greedy loop (``mergeChildrenUB``, TH:1039-1620;
 ``getOptimalDLogLPairInfoNew``, TH:2381-2456; ``mergeNodes``, TH:2459-2646; ``mergeZeroTimeChilds``, TH:789-807; ``mergeChildrenRecursive``, TH:968-1012), CC BY-NC
 4.0, as the M2 engine defines them: every round scores **all** pairs (no bounds, no kNN), the
-add-as-child move is a zero edge (A18), there is no zero-root branch (A21b: upstream's
-reopt/reset on a best pair with t_aR <= 1e-6 sees the t_aR of its tol-1e-4 solve and practically never fires), and ``mergeDownstreamChildrenSingle`` is replaced by the
-deferred collapse of redo starry. Node ids: leaves 0..N−1, root N, new nodes count up in merge order
+add-as-child move is a zero edge (A18) that is collapsed at once and followed by upstream's recursive special-child
+greedy at the receiving node (``mergeDownstreamChildrenSingle``, TH:935-966, 1029-1036, 2637-2641; A18b), and there is
+no zero-root branch (A21b: upstream's reopt/reset on a best pair with t_aR <= 1e-6 sees the t_aR of its tol-1e-4 solve
+and practically never fires). Node ids: leaves 0..N−1, root N, new nodes count up in merge order
 and are never reused. Units: 2x log-likelihoods (A1).
 
 Messages are recomputed from scratch (no incremental updates): a parent's AIR from its current
@@ -32,7 +33,6 @@ REDO_NN_FRAC, REDO_NN_MIN = 0.1, 10  # kNN rebuild schedule (TH:1951, A19); unus
 NN_MIN_CHILDREN = 50  # kNN only when C > 50 (MA:176, TH:1888); unused here
 LAZY_MIN_CHILDREN = 10  # bounds only when C > 10 (TH:1040); unused here
 STAR_TOL, STAR_MAX_SWEEPS, STAR_T_MAX = 1e-4, 1000, 1e8  # star EM (TH:4992-5004)
-ZERO_EDGE_PASSES = 8  # cap on collapse + redo passes (A18)
 K_NN = 10  # use_knn (config.py:75); unused here
 
 
@@ -43,6 +43,7 @@ class Event(NamedTuple):
     new: int  # id of the created node; -1 for "reopt"
     dlogl: float  # the pair's score; nan for "reopt"
     t: tuple[float, float, float]  # (t_1a, t_2a, t_aR) as applied (after the A18 snap); nan for "reopt"
+    depth: int = 0  # 0: a round of the called greedy; k ≥ 1: of the special-child greedy k snaps deep (A18b)
 
 
 class Tree(NamedTuple):
@@ -106,6 +107,11 @@ def decide(cands) -> tuple[int, int] | None:
     return best
 
 
+def max_passes(n_cells: int) -> int:
+    """Redo-starry pass cap N − 1 (A18b): each pass strictly shrinks the zero-edge leaf sets."""
+    return max(n_cells - 1, 1)
+
+
 def _set_message(tree: Tree, p: int) -> None:
     kids = children(tree, p)
     xn, W = node_message(tree.x[kids], tree.var[kids], tree.t[kids])
@@ -119,6 +125,8 @@ def greedy_star(
     mode: str = "sequential",
     star_tol: float = STAR_TOL,
     trace: list | None = None,
+    special: int | None = None,
+    depth: int = 0,
 ) -> tuple[Tree, list[Event]]:
     r"""Greedily merge the children of ``p`` (maths ref §8), scoring all pairs every round.
 
@@ -127,13 +135,23 @@ def greedy_star(
     max(⌊0.05·C⌋, 10) (recomputed at each re-optimisation); else score every pair of current children
     (child 1 = lower id) at p's current AIR and merge ``decide``'s pair into a new node with the A18 snap (t_1a < 1e-6 and child 1 internal → t_1a := 0, else the
     same for child 2), counter += 1. Stops at ≤ 3 children (root) / ≤ 2 (other) or when no pair has dLogL > 1e-6.
-    ``trace``: one entry per round, appended before the decision, (scores: {(i, j): (dLogL, t3)},
-    {child: t}, x_r, W_r, counter); a periodic re-optimisation round has no scores. Returns the new
-    tree (input untouched; p's row holds its updated message) and the events.
+
+    A snap (A18b) is upstream's add-as-child: the zero edge is collapsed at once (the receiving child r leaves, its
+    children move to the new node a, so a's star is r's children plus the moved child m, as upstream's r after
+    TH:2476, 2548, 2572-2575), then ``greedy_star(a, special=m, depth + 1)`` runs with a's outside message from p
+    (TH:1019-1021): it scores only the pairs (m, c), c another child of a (TH:1631), bounds and kNN off (TH:2293,
+    2306), no periodic re-optimisation (non-root, TH:1927), and stops after at most one merge (expNChild =
+    max(C − 1, 2), TH:2301, 1596); that merge may snap and recurse again (mergeDownstream=True, TH:1467, 2637).
+    p's own counter counts the snap merge once.
+    ``trace``: one entry per round, appended before the decision, in execution order (a special-child round right
+    after the merge that triggered it), (scores: {(i, j): (dLogL, t3)}, {child: t}, x_r, W_r, counter); counter is
+    −depth in a special-child round; a periodic re-optimisation round has no scores. ``events`` likewise, flat.
+    Returns the new tree (input untouched; p's row holds its updated message) and the events.
     """
     tree = _copy(tree)
     is_root = outside is None
     kids = children(tree, p)
+    stop = (3 if is_root else 2) if special is None else max(len(kids) - 1, 2)
     redo_at = max(int(REDO_TIME_FRAC * len(kids)), REDO_TIME_MIN)
     counter, events = 0, []
     nan3 = (np.nan, np.nan, np.nan)
@@ -144,7 +162,7 @@ def greedy_star(
         redo_at, counter = max(int(REDO_TIME_FRAC * len(kids)), REDO_TIME_MIN), 0
         events.append(Event("reopt", -1, -1, -1, np.nan, nan3))
 
-    while len(kids) > (3 if is_root else 2):
+    while len(kids) > stop:
         if is_root and counter > redo_at:  # TH:1926-1927 (A21: on any round)
             if trace is not None:
                 trace.append(({}, {c: float(tree.t[c]) for c in kids}, *_air(tree, kids, None), counter))
@@ -152,10 +170,12 @@ def greedy_star(
             continue
         xr, Wr = _air(tree, kids, outside)
         x, v, t = tree.x, tree.var, tree.t
-        scores = {
-            (i, j): pair_score(x[i], v[i], t[i], x[j], v[j], t[j], xr, Wr, mode)
-            for i, j in itertools.combinations(kids, 2)
-        }
+        pairs = (
+            itertools.combinations(kids, 2)
+            if special is None
+            else [(min(special, c), max(special, c)) for c in kids if c != special]
+        )
+        scores = {(i, j): pair_score(x[i], v[i], t[i], x[j], v[j], t[j], xr, Wr, mode) for i, j in pairs}
         if trace is not None:
             trace.append(
                 (
@@ -163,7 +183,7 @@ def greedy_star(
                     {c: float(t[c]) for c in kids},
                     xr,
                     Wr,
-                    counter,
+                    -depth if depth else counter,
                 )
             )
         ij = decide((ij, s.dlogl) for ij, s in scores.items())
@@ -172,10 +192,11 @@ def greedy_star(
         i, j = ij
         s = scores[ij]
         t1a, t2a, t_ar = (float(u) for u in s.t)
+        recv = None  # the receiving child of an add-as-child snap
         if t1a < ADD_AS_CHILD_T and not tree.is_cell[i]:  # child 1 first (TH:2467-2476)
-            t1a = 0.0
+            t1a, recv = 0.0, i
         elif t2a < ADD_AS_CHILD_T and not tree.is_cell[j]:
-            t2a = 0.0
+            t2a, recv = 0.0, j
         a = len(tree.parent)
         xa, Wa = node_message(x[[i, j]], v[[i, j]], np.array([t1a, t2a]))
         tree = Tree(
@@ -189,7 +210,15 @@ def greedy_star(
         tree.t[i], tree.t[j] = t1a, t2a
         kids = [c for c in kids if c not in (i, j)] + [a]
         counter += 1
-        events.append(Event("merge", i, j, a, s.dlogl, (t1a, t2a, t_ar)))
+        events.append(Event("merge", i, j, a, s.dlogl, (t1a, t2a, t_ar), depth))
+        if recv is not None:
+            tree.parent[tree.parent == recv] = a  # collapse the zero edge: a's star = recv's children + the moved child
+            tree.parent[recv] = -2
+            xo, Wo = _air(tree, [c for c in kids if c != a], outside)  # p without a (TH:5313-5331)
+            tree, sub = greedy_star(
+                tree, a, (xo, 1.0 / (t_ar + 1.0 / Wo)), mode, star_tol, trace, j if recv == i else i, depth + 1
+            )
+            events += sub
     _set_message(tree, p)
     return tree, events
 
@@ -262,19 +291,21 @@ def redo_starry(
 
     A pass: ``collapse_zero_edges``, then post-order (children by increasing id) ``greedy_star`` at
     every node with > 3 children (root) / > 2 (other), with its AIR from the current tree. Passes
-    repeat while the tree has a zero edge above a live internal non-cell node; passes after the first run
-    the greedy only at the nodes the collapse gave children. More than ``ZERO_EDGE_PASSES`` passes
+    repeat while the tree has a zero edge above a live internal non-cell node (snaps are resolved inside the
+    greedy, A18b, so these come from exact-zero optima or star re-optimisations); passes after the first run
+    the greedy only at the nodes the collapse gave children. More than ``max_passes(N)`` = N − 1 passes
     needed: ``RuntimeWarning``, the tree is returned as is (valid, with those zero edges).
     """
     events: list[Event] = []
-    for n_pass in range(1, ZERO_EDGE_PASSES + 1):
+    cap = max_passes(int(tree.is_cell.sum()))
+    for n_pass in range(1, cap + 1):
         tree, gained = collapse_zero_edges(tree, root)
         tree, pass_events = _redo_pass(tree, root, None if n_pass == 1 else set(gained), mode, star_tol)
         events += pass_events
         if not _zero_edge(tree, root):
             return tree, events, n_pass
-    warnings.warn(f"redo_starry: zero edges remain after {ZERO_EDGE_PASSES} passes", RuntimeWarning, stacklevel=2)
-    return tree, events, ZERO_EDGE_PASSES
+    warnings.warn(f"redo_starry: zero edges remain after {cap} passes", RuntimeWarning, stacklevel=2)
+    return tree, events, cap
 
 
 def greedy_tree(x: np.ndarray, var: np.ndarray, mode: str = "sequential", star_tol: float = STAR_TOL):

@@ -17,7 +17,7 @@ from bonsai._ref.greedy import (
     redo_starry,
 )
 from bonsai._ref.pair import PAIR_LOG_T_MIN
-from bonsai._ref.star import node_message, star_em
+from bonsai._ref.star import star_em
 from bonsai._ref.tree import tree_loglik, tree_loglik_grad
 
 from ._bounds import EPS64, loglik_scale, tree_height
@@ -120,6 +120,7 @@ def test_each_merge_score_is_the_exact_tree_change():
     tree0 = _star(x, var)
     trace: list = []
     final, events = greedy_star(tree0, 12, None, trace=trace)
+    assert all(e.depth == 0 for e in events)  # precondition: root rounds only, trace[k] is event k's round
     N, root = 12, 12
     checked = 0
     for k, ev in enumerate(events):
@@ -141,6 +142,34 @@ def test_each_merge_score_is_the_exact_tree_change():
         assert abs((L1 - L0) - ev.dlogl) <= tol, (k, L1 - L0, ev.dlogl, tol)
         checked += 1
     assert checked >= N // 2  # non-vacuous: most of the 9 merges are checked
+
+
+def test_special_child_merges_are_exact_tree_changes():
+    """A18b, maths ref §6 (independent brute force): over a root greedy with nested special-child greedies, L_tree(end)
+    − L_tree(star) = Σ dLogL of every merge, special-child ones included. This checks each special-child score
+    against the true tree change, so it checks the outside message the receiving node sees from its parent.
+
+    C = 10, seed 8 (the "nested_snap" fixture); precondition (asserted): every snap was scored at exactly t = 0, so
+    snapping moves no time and no reopt runs (C ≤ 13)."""
+    x, var = _leaves(10, 8)
+    tree0 = _star(x, var)
+    trace: list = []
+    final, events = greedy_star(tree0, 10, None, trace=trace)
+    assert 2 in [e.depth for e in events]
+    merges = iter(events)
+    for scores, *_ in trace:
+        ij = decide((p, d) for p, (d, _) in scores.items())
+        if ij is None:
+            continue
+        e = next(merges)
+        assert e.kind == "merge" and (e.i, e.j) == ij
+        for c, n in ((0, e.i), (1, e.j)):
+            assert e.t[c] != 0.0 or final.is_cell[n] or scores[ij][1][c] == 0.0
+    p1, t1, x1, v1, _ = compact(final, 10)
+    p0, t0 = tree0.parent, tree0.t
+    gain = tree_loglik(p1, t1, x1, v1) - tree_loglik(p0, t0, tree0.x, tree0.var)
+    tol = _rounding_tol(p0, t0, tree0.x, tree0.var, 0) + _rounding_tol(p1, t1, x1, v1, len(events))
+    assert abs(gain - sum(e.dlogl for e in events)) <= tol
 
 
 def test_tie_rule_prefers_lower_ids(monkeypatch):
@@ -236,13 +265,22 @@ def test_add_as_child_snap(monkeypatch, pair, t3, applied):
         return s
 
     monkeypatch.setattr(rg, "pair_score", fake)
-    final, events = greedy_star(tree, 9, None)
+    trace: list = []
+    final, events = greedy_star(tree, 9, None, trace=trace)
     e = events[0]
     assert (e.kind, e.i, e.j) == ("merge", *pair) and e.t == applied
-    assert (final.t[e.i], final.t[e.j]) == applied[:2]  # the new node's own edge may move later
-    # a zero edge passes child's message unchanged: the new node's message uses w = W_child
-    xa, Wa = node_message(final.x[[e.i, e.j]], final.var[[e.i, e.j]], np.array(applied[:2]))
-    np.testing.assert_array_equal(final.x[e.new], xa)
+    recv = [c for c, tc in zip(pair, applied[:2], strict=True) if tc == 0.0 and not tree.is_cell[c]]
+    if not recv:
+        assert (final.t[e.i], final.t[e.j]) == applied[:2]
+        assert not any(entry[4] < 0 for entry in trace)  # no special-child greedy
+        return
+    # A18b: the receiving child r is collapsed into the new node at once, and the next round is the special-child
+    # greedy there: its star is r's children plus the moved child m, scoring only the pairs (m, c) (TH:1631)
+    r, m = recv[0], pair[1] if recv[0] == pair[0] else pair[0]
+    assert final.parent[r] == -2 and final.t[r] == 0.0
+    sub = trace[1]
+    assert sub[4] == -1 and set(sub[1]) == set(children(tree, r)) | {m}
+    assert set(sub[0]) == {(min(m, c), max(m, c)) for c in children(tree, r)}
 
 
 @pytest.mark.parametrize("C", [24, pytest.param(40, marks=pytest.mark.slow)])
@@ -265,6 +303,8 @@ def test_periodic_reopt_schedule(monkeypatch, C):
     monkeypatch.setattr(rg, "star_em", counted)
     trace: list = []
     _, events = greedy_star(tree0, C, None, trace=trace)
+    assert any(e.depth for e in events)  # special-child rounds (A18b) are interleaved; the root's own are checked
+    trace, events = [e for e in trace if e[4] >= 0], [e for e in events if e.depth == 0]
     n_child, counter = C, 0
     redo = max(int(0.05 * n_child), 10)
     for r, e in enumerate(events):
@@ -323,9 +363,10 @@ def test_redo_starry_gain_equals_sum_of_scores():
     assert abs(gain - sum(e.dlogl for e in events)) <= tol
 
 
-def test_redo_starry_repeats_after_a_snap(monkeypatch):
-    """A snap in redo starry leaves a zero edge: the next pass collapses it and runs the greedy at the touched
-    node only; at the pass cap the RuntimeWarning fires and the zero edge stays (A18).
+def test_redo_starry_resolves_snaps_inside_the_merge(monkeypatch):
+    """A snap in redo starry is resolved inside the merge (A18b; TH:2637-2641, ``mergeChildrenRecursive`` calls
+    ``mergeChildrenUB`` with mergeDownstream=True, TH:1004-1007): the receiving child is collapsed at once and the
+    special-child greedy runs at the new node, so one pass leaves no zero edge.
 
     Root 7: cells 4, 5, 6 and internal 9 (internal 8 (cells 0, 1), cells 2, 3). ``pair_score`` is wrapped
     to force the first merge at 9: (2, 8) with t_2a = 5e-7 (snapped to 0)."""
@@ -345,51 +386,51 @@ def test_redo_starry_repeats_after_a_snap(monkeypatch):
 
     monkeypatch.setattr(rg, "pair_score", fake)
     out, events, passes = redo_starry(tree, 7)
-    # pass 1 (post-order: 9, then the root): the forced merge at 9 snaps t(8) := 0 and the root's merge
-    # (4, 9) snaps t(9) := 0 (its optimum t_2a < 1e-6). Pass 2 collapses 8 into 10 and 9 into 11 and runs
-    # the greedy at those touched nodes only, post-order: 10 (children 0, 1, 2), then 11 (3, 4, 10)
-    # (pins: one merge at each)
-    assert [(e.i, e.j, e.t[1]) for e in events[:2]] == [(2, 8, 0.0), (4, 9, 0.0)] and forced
-    assert passes == 2 and out.parent[8] == out.parent[9] == -2
-    assert [(e.i, e.j, out.parent[e.new]) for e in events[2:]] == [
-        (1, 2, 10),
-        (3, 10, 11),
-    ]  # both at the t_aR bound (A21b)
-    forced.clear()
-    monkeypatch.setattr(rg, "ZERO_EDGE_PASSES", 1)
-    with pytest.warns(RuntimeWarning, match="zero edges remain"):
-        out, _, passes = redo_starry(tree, 7)
-    assert passes == 1 and out.t[8] == 0.0 and out.parent[8] >= 0
-    # natural case (random_tree(14, max_children=5), seed 3: the first seed needing a second pass): no zero
-    # edge above an internal non-cell node remains
+    # post-order: at 9 the forced merge snaps t(8) := 0, 8 collapses into 10 (cells 0, 1, 2) and the special-child
+    # greedy (special 2) merges (1, 2) under 10; at the root (4, 9) snaps t(9) := 0 (its optimum t_2a < 1e-6), 9
+    # collapses into 12 (cells 3, 4, node 10) and the special-child greedy (special 4) merges (4, 10) (pins)
+    assert forced and [(e.i, e.j, e.new, e.depth, e.t[1]) for e in events] == [
+        (2, 8, 10, 0, 0.0),
+        (1, 2, 11, 1, events[1].t[1]),
+        (4, 9, 12, 0, 0.0),
+        (4, 10, 13, 1, events[3].t[1]),
+    ]
+    assert passes == 1 and out.parent[8] == out.parent[9] == -2
+    assert children(out, 10) == [0, 11] and children(out, 12) == [3, 13] and children(out, 13) == [4, 10]
+    assert not rg._zero_edge(out, 7)
+    # natural case (random_tree(14, max_children=5), seed 3: before A18b the first seed needing a second pass): no
+    # zero edge above an internal non-cell node remains
     monkeypatch.undo()
     rng = np.random.default_rng(3)
     parent, t = random_tree(14, rng, max_children=5)
     x, var = _bm_on(parent, t, rng)
-    out, _, passes = redo_starry(_from_tree(parent, t, x, var), len(parent) - 1)
-    p, tt, *_ = compact(out, len(parent) - 1)
-    assert passes == 2
-    assert not np.any((tt == 0) & np.isin(np.arange(len(p)), p) & (p >= 0))
+    out, events, passes = redo_starry(_from_tree(parent, t, x, var), len(parent) - 1)
+    assert any(e.depth for e in events)  # a snap with its special-child greedy
+    assert not rg._zero_edge(out, len(parent) - 1)
 
 
-def test_redo_starry_later_passes_run_only_at_touched_nodes(monkeypatch):
-    """Passes after the first run the greedy only at the nodes the collapse gave children (A18; Task 7).
+@pytest.mark.parametrize("n_forced", [1, 6, 7])
+def test_redo_starry_later_passes_run_only_at_touched_nodes(monkeypatch, n_forced):
+    """Passes after the first run the greedy only at the nodes the collapse gave children (A18; Task 7), and passes
+    repeat while a zero edge remains, at most N − 1 = 7 (8 cells; A18b), then ``RuntimeWarning``.
 
     Root 8: cell 7, internal 10 (internal 9 (cells 0, 1), cells 2, 3) and 11 (cells 4, 5, 6 with var 1e10:
-    no pair qualifies, so 11 keeps three children). The merge at 10 is forced to (2, 9) with t_2a = 5e-7
-    (snapped to 0); pass 2 collapses 9 into the new node 12 and runs the greedy there, not again at 11.
+    no pair qualifies, so 11 keeps three children). The merge at 10 is forced, ``n_forced`` times, to (2, 9) with
+    t_aR = 0 exactly (a zero edge above the new internal node, no snap); the next pass collapses that node into 10
+    (children 2, 3, 9 again) and runs the greedy there, not again at 11. So n_forced + 1 passes are needed.
     """
     parent = np.array([9, 9, 10, 10, 11, 11, 11, 8, -1, 10, 8, 8])
     rng = np.random.default_rng(4)
     x, var = rng.normal(size=(12, G)), rng.uniform(0.05, 0.3, (12, G))
     var[4:7] = 1e10  # pair dLogL ∝ 1/var: ≈ 5e-9 here, 200× below the 1e-6 accept threshold
     tree = _from_tree(parent, np.r_[rng.uniform(0.2, 1.0, 8), 0.0, rng.uniform(0.2, 1.0, 3)], x, var)
-    real_score, real_star, calls = rg.pair_score, rg.greedy_star, []
+    real_score, real_star, calls, forced = rg.pair_score, rg.greedy_star, [], []
 
     def fake(x1, v1, t1, x2, v2, t2, xr, Wr, mode="sequential"):
         s = real_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode)
-        if np.array_equal(x1, tree.x[2]) and np.array_equal(x2, tree.x[9]):
-            return s._replace(dlogl=1e3, t=np.array([0.3, 5e-7, 0.5]))
+        if len(forced) < n_forced and np.array_equal(x1, tree.x[2]) and np.array_equal(x2, tree.x[9]):
+            forced.append(True)
+            return s._replace(dlogl=1e3, t=np.array([0.3, 0.4, 0.0]))
         return s
 
     def record(tr, p, *args, **kwargs):
@@ -398,9 +439,16 @@ def test_redo_starry_later_passes_run_only_at_touched_nodes(monkeypatch):
 
     monkeypatch.setattr(rg, "pair_score", fake)
     monkeypatch.setattr(rg, "greedy_star", record)
-    out, events, passes = redo_starry(tree, 8)
-    assert events[0][:4] == ("merge", 2, 9, 12) and events[0].t[1] == 0.0
-    assert passes == 2 and calls == [10, 11, 12]
+    assert rg.max_passes(8) == 7
+    if n_forced + 1 > 7:
+        with pytest.warns(RuntimeWarning, match="zero edges remain after 7 passes"):
+            out, events, passes = redo_starry(tree, 8)
+        assert rg._zero_edge(out, 8)  # returned as is
+    else:
+        out, events, passes = redo_starry(tree, 8)
+        assert not rg._zero_edge(out, 8)
+    assert events[0][:4] == ("merge", 2, 9, 12) and events[0].t[2] == 0.0 and out.parent[12] == -2
+    assert passes == min(n_forced + 1, 7) and calls == [10, 11] + [10] * (passes - 1)
     assert children(out, 11) == [4, 5, 6]
 
 
@@ -482,57 +530,78 @@ def _round_ok(scores, event, is_cell) -> str | None:
     return None
 
 
-def _leafset(tree: Tree, c: int) -> frozenset:
-    kids = children(tree, c)
-    return frozenset([c]) if not kids else frozenset().union(*(_leafset(tree, k) for k in kids))
-
-
 def _unordered(decisions):
     return [(kind, frozenset((a, b))) for kind, a, b in decisions]
 
 
 def _ref_decisions(x, var, t):
-    """(decisions as upstream_merge_children reports them, compared events, end reason or None, final tree)."""
+    """(decisions as upstream_merge_children reports them, compared events, end reason or None, final tree).
+
+    Walks the trace in execution order, special-child rounds included (A18b): a scored round consumes the next event
+    iff ``decide`` merges, a re-optimisation round its reopt event. Leaf sets come from the events: a node's leaf set
+    is fixed when it is created (restructuring below it keeps it), so it is the one upstream sees at the decision.
+    """
     trace: list = []
     final, events = greedy_star(_star(x, var, t), len(x), None, trace=trace)
+    leaves = {c: frozenset([c]) for c in range(len(x))}
     out: list = []
-    for r, (scores, _, _, _, _) in enumerate(trace):
-        e = events[r] if r < len(events) else None
+    k = 0
+    for scores, _, _, _, _ in trace:
+        merges = not scores or decide((ij, d) for ij, (d, _) in scores.items()) is not None
+        e = events[k] if merges else None
         reason = _round_ok(scores, e, final.is_cell) if scores else None
         if reason is not None:
-            return out, events[:r], reason, final
+            return out, events[:k], reason, final
         if e is None:
-            break
-        out.append(
-            ("reopt", frozenset(), frozenset())
-            if e.kind == "reopt"
-            else (e.kind, _leafset(final, e.i), _leafset(final, e.j))
-        )
+            continue
+        k += 1
+        if e.kind == "reopt":
+            out.append(("reopt", frozenset(), frozenset()))
+        else:
+            leaves[e.new] = leaves[e.i] | leaves[e.j]
+            out.append((e.kind, leaves[e.i], leaves[e.j]))
+    assert k == len(events)
     return out, events, None, final
 
 
-# Seed = the first in 0, 1, ... whose reference run meets the case's precondition (asserted below), chosen from
-# the reference alone. "zero_root_merge" (seed 6) is where A21's zero-root reopt diverged from upstream.
-UPSTREAM_CASES = {"plain": 0, "add_as_child": 2, "zero_root_merge": 6}
+# (C, seed): seed = the first in 0, 1, ... whose reference run meets the case's precondition (asserted below), chosen
+# from the reference alone. "zero_root_merge" (seed 6) is where A21's zero-root reopt diverged from upstream.
+# "snap_then_more": a special-child merge (A18b) followed by further root merges; "nested_snap": a special-child
+# merge two snaps deep; both compared over the whole run.
+UPSTREAM_CASES = {
+    "plain": (8, 0),
+    "add_as_child": (8, 2),
+    "zero_root_merge": (8, 6),
+    "snap_then_more": (8, 10),
+    "nested_snap": (10, 8),
+}
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("case", list(UPSTREAM_CASES))
 def test_reference_matches_upstream_merge_sequence(case):
-    """C = 8 bm_tree leaves, G = 30, star times from ``star_em``; upstream ``mergeChildrenUB`` (all pairs, C <= 10).
+    """C bm_tree leaves, G = 30, star times from ``star_em``; upstream ``mergeChildrenUB`` (all pairs, C <= 10) with
+    ``mergeDownstream=True``, as its root greedy (MA:177-180).
 
-    The reference's decisions, as (kind, {leaf set 1, leaf set 2}), equal upstream's over the compared prefix;
-    an upstream add-as-child is the reference's snapped merge (same leaf sets).
+    The reference's decisions, as (kind, {leaf set 1, leaf set 2}), equal upstream's over the compared prefix, in call
+    order: an upstream add-as-child is the reference's snapped merge (same leaf sets), followed by the merges of its
+    recursive special-child greedy (A18b).
     """
-    x, var = _leaves(8, UPSTREAM_CASES[case])
+    C, seed = UPSTREAM_CASES[case]
+    x, var = _leaves(C, seed)
     t = star_em(x, var)[0]
     ref, compared, reason, final = _ref_decisions(x, var, t)
     if case == "plain":
         assert reason is None and {e.kind for e in compared} == {"merge"}  # the whole run is compared
     elif case == "add_as_child":
         assert any(_snap_candidate(final, e) for e in compared), reason
-    else:  # a merged pair with t_aR <= 1e-6 in the compared prefix
+    elif case == "zero_root_merge":  # a merged pair with t_aR <= 1e-6 in the compared prefix
         assert any(e.kind == "merge" and e.t[2] <= 1e-6 for e in compared), reason
+    elif case == "snap_then_more":
+        depth = [e.depth for e in compared]
+        assert reason is None and 1 in depth and 0 in depth[depth.index(1) + 1 :], (reason, depth)
+    else:
+        assert reason is None and 2 in [e.depth for e in compared], reason
     up = upstream_merge_children(x, var, t)
     # unordered: upstream's add-as-child keeps child 1's nodeInd, so the child order can differ after a snap
     up, ref = _unordered(up), _unordered(ref)

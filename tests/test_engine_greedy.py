@@ -21,10 +21,11 @@ G = 60
 N = 24
 EXACT = GreedyConfig(knn=False, lazy=False, star_tol=1e-10)
 FP32 = GreedyConfig(knn=False, lazy=False, star_tol=1e-4)  # upstream's star tolerance
-# First near-tie round k* per fixture: measured by the supervisor 2026-10-22 (Task 9 Step 2a), regression pin.
+# First near-tie round k* per fixture (flat trace, special-child rounds included): measured by the supervisor
+# 2026-10-28 after A18b (Task 9 Step 2a), regression pin.
 # Remeasure with (prints "fixture: first near-tie k*, first divergence d, rounds n"):
 #   JAX_PLATFORMS=cpu uv run --locked pytest -q -s tests/test_engine_greedy.py -k "up_to_first_near_tie or 48_leaves"
-MIN_K_STAR: dict[str, int] = {"seed11": 22, "seed12": 22, "dup": 22, "nonroot": 14, "bm48": 49}
+MIN_K_STAR: dict[str, int] = {"seed11": 28, "seed12": 24, "dup": 5, "nonroot": 14, "bm48": 56}
 FIXTURES = ["seed11", "seed12", "dup", "nonroot"]
 
 
@@ -81,7 +82,27 @@ _run_cached = functools.cache(_run)
 
 
 def _key(e):
-    return (e.kind, e.i, e.j, e.new)
+    return (e.kind, e.i, e.j, e.new, e.depth)
+
+
+def _decision(entry):
+    """A trace round's decision: "reopt", the merged pair, or None (stop). ``decide`` on the round's stored scores, the
+    arm's own decision for exhaustive rounds (every candidate fresh; A24 host re-scores are stored)."""
+    return "reopt" if not entry[0] else rg.decide((p, v[0]) for p, v in entry[0].items())
+
+
+def _event_rounds(trace) -> list[int]:
+    """Trace index of each event's round (A18b: special-child rounds interleave, and one that merges nothing has no
+    event)."""
+    return [k for k, entry in enumerate(trace) if _decision(entry) is not None]
+
+
+def _divergence_round(ref_trace, eng_trace) -> int | None:
+    """First round whose children or decision differ between the arms, None if none (exhaustive rounds)."""
+    for k, (a, b) in enumerate(zip(ref_trace, eng_trace, strict=False)):
+        if set(a[1]) != set(b[1]) or _decision(a) != _decision(b):
+            return k
+    return None if len(ref_trace) == len(eng_trace) else min(len(ref_trace), len(eng_trace))
 
 
 def test_constants_match_reference():
@@ -97,10 +118,10 @@ def test_constants_match_reference():
         "STAR_TOL",
         "STAR_MAX_SWEEPS",
         "STAR_T_MAX",
-        "ZERO_EDGE_PASSES",
         "K_NN",
     ]
     assert {k: getattr(eg, k) for k in names} == {k: getattr(rg, k) for k in names}
+    assert [eg.max_passes(n) for n in (1, 2, 8, 1000)] == [rg.max_passes(n) for n in (1, 2, 8, 1000)] == [1, 1, 7, 999]
     assert not hasattr(eg, "ZERO_ROOT_T") and not hasattr(eg, "DLOGL_FLOOR")  # A21b
 
 
@@ -138,15 +159,58 @@ def _pair_scale(ref_tree, entry, i, j, t3) -> float:
 @pytest.mark.x64
 @pytest.mark.parametrize("name", FIXTURES)
 def test_engine_matches_reference_x64(name):
-    stats, _, _, ref_events, ref_trace, ref_tree = _run(name, EXACT, jnp.float64)
+    stats, eng_trace, table, ref_events, ref_trace, ref_tree = _run(name, EXACT, jnp.float64)
     assert [_key(e) for e in stats.events] == [_key(e) for e in ref_events]
+    _assert_special_air(eng_trace, ref_trace, table, ref_tree, stats.events, ref_events)
     assert any(e.kind == "reopt" for e in ref_events) == (name != "nonroot")  # the periodic reopt is exercised
+    if name == "seed11":  # A18b: special-child greedies, one of them two snaps deep, are compared too
+        assert 2 in [e.depth for e in ref_events]
+    rounds = _event_rounds(ref_trace)
     # dLogL: both solvers stop at their fp64 KKT resolution, (G + 64)·eps64·Σ|terms| per pair
     for k, (a, b) in enumerate(zip(stats.events, ref_events, strict=True)):
         if b.kind == "merge":
-            scale = _pair_scale(ref_tree, ref_trace[k], b.i, b.j, ref_trace[k][0][b.i, b.j][1])
+            entry = ref_trace[rounds[k]]
+            scale = _pair_scale(ref_tree, entry, b.i, b.j, entry[0][b.i, b.j][1])
             assert abs(a.dlogl - b.dlogl) <= (G + 64) * EPS64 * scale, (k, a.dlogl, b.dlogl)
     assert stats.n_flagged_used_unrescored == 0
+
+
+def _assert_special_air(eng_trace, ref_trace, table, ref_tree, eng_events, ref_events) -> None:
+    """A18b: every special-child round's AIR (x_r, W_r), i.e. the receiving node's children plus the outside message
+    it gets from its parent, equals the reference's (from scratch) in the same flat round.
+
+    Bound: rounding plus first-order propagation of the arms' legitimate input differences (both pair solvers stop at
+    their own fp64 KKT resolution, so times and node rows differ at ~1e-14). Its resolution on the outside message is
+    ~1e-9 relative; the per-merge dLogL check in the same test is the tighter gate (~1e-10).
+    - Rounding (``_assert_parent_state``'s convention): the outside comes from the parent's accumulator, ≤ n_ops =
+      C0 + 1 + 5k + C + 4 fp64 updates by round k, each ≤ eps64·S, S = the largest W_r of any shallower round so far
+      (every partial sum of an ancestor's positive weights is ≤ it; removals only shrink them).
+    - Inputs: W_r is a sum of weights 1/(v + t) of a's children, of the parent's other children, … and of w̃ =
+      1/(t_a + 1/W_ex); each weight is ≤ S and |∂w/∂t| = |∂w/∂v| = w², |∂w̃/∂W_ex| ≤ 1, so |ΔW_r| ≤ S²·(Δt + Δv) with
+      Δt = Σ |Δt| over every child time recorded so far and every applied event time, Δv = Σ over node rows of max|Δv|.
+      x_r·W_r = Σ w·x: |Δ| ≤ X·S²·(Δt + Δv) + S·Δx, X = max|x|, Δx = Σ over node rows of max|Δx|.
+    """
+    assert len(eng_trace) == len(ref_trace)
+    n = table.n
+    C0, X = len(ref_trace[0][1]), float(np.abs(table.x[:n]).max())
+    dv = float(np.abs(table.v[:n] - ref_tree.var[:n]).max(axis=1).sum())
+    dx = float(np.abs(table.x[:n] - ref_tree.x[:n]).max(axis=1).sum())
+    dt_ev = sum(float(np.nansum(np.abs(np.subtract(a.t, b.t)))) for a, b in zip(eng_events, ref_events, strict=True))
+    S_by_depth: dict[int, np.ndarray] = {}  # depth -> running max of W_r over the rounds at that depth
+    dt, checked = dt_ev, 0
+    for k, (e, r) in enumerate(zip(eng_trace, ref_trace, strict=True)):
+        depth = -r[4] if r[4] < 0 else 0
+        assert set(e[1]) == set(r[1]) and (e[4] < 0) == (r[4] < 0), k
+        dt += sum(abs(e[1][c] - r[1][c]) for c in r[1])
+        if depth:
+            S = np.max([S_by_depth[d] for d in range(depth)], axis=0)
+            n_ops = C0 + 1 + 5 * k + len(r[1]) + 4
+            prop = S**2 * (dt + dv)
+            assert np.all(np.abs(e[3] - r[3]) <= n_ops * EPS64 * S + prop), k
+            assert np.all(np.abs(e[2] * e[3] - r[2] * r[3]) <= (n_ops + 2) * EPS64 * S * X + X * prop + S * dx), k
+            checked += 1
+        S_by_depth[depth] = np.maximum(S_by_depth.get(depth, 0.0), np.maximum(r[3], e[3]))
+    assert checked == sum(1 for r in ref_trace if r[4] < 0)
 
 
 def _first_divergence(ref_events, eng_events) -> int | None:
@@ -160,6 +224,7 @@ def _assert_reopt_schedule(trace, events, n_children: int, is_root: bool) -> Non
     """A21: the counter is the number of merges since the last re-optimisation (or the start), replayed from the
     events; a root round re-optimises iff it is > max(⌊0.05·C⌋, 10), C = the children at the last one (or start)."""
     since, redo_at = 0, max(int(0.05 * n_children), 10)
+    trace, events = [e for e in trace if e[4] >= 0], [e for e in events if e.depth == 0]  # p's own rounds (A18b)
     for entry, ev in zip(trace, events, strict=False):  # the stop round has no event
         assert entry[4] == since
         assert (ev.kind == "reopt") == (is_root and since > redo_at)
@@ -170,11 +235,13 @@ def _assert_parent_state(trace, table, outside) -> None:
     """The engine's fp64 AIR (x_r, W_r) at every round equals a from-scratch sum over its children (host fp64
     weights from the stored rows and the round's t, plus the outside message), as W and W·x_r.
 
-    Bound: by round k the accumulator has had ≤ C0 + 1 + 3k rounded updates (build, outside, two removals and one
-    addition per round) and the recomputation ≤ C + 1 more, each ≤ eps64 times a partial sum of |terms|; removals
-    only shrink partial sums, so every one is ≤ S = the largest round total of |terms| so far. x_r·W_r adds 2
-    roundings (division in ``message``, product here) of size ≤ S.
+    Bound: by round k the accumulator has had ≤ C0 + 1 + 5k rounded updates (build, outside, two removals and one
+    addition per round, plus the removal and addition replacing the new node after a special-child greedy, A18b) and
+    the recomputation ≤ C + 1 more, each ≤ eps64 times a partial sum of |terms|; removals only shrink partial sums, so
+    every one is ≤ S = the largest round total of |terms| so far. x_r·W_r adds 2 roundings (division in ``message``,
+    product here) of size ≤ S. Only p's own rounds (counter ≥ 0) are checked.
     """
+    trace = [e for e in trace if e[4] >= 0]
     C0 = len(trace[0][1])
     S_W = S_X = 0.0
     for k, (_, tk, xr, Wr, _) in enumerate(trace):
@@ -185,7 +252,7 @@ def _assert_parent_state(trace, table, outside) -> None:
             w, wx = np.vstack([w, outside[1]]), np.vstack([wx, outside[1] * outside[0]])
         W, WX = w.sum(axis=0), wx.sum(axis=0)
         S_W, S_X = np.maximum(S_W, W), np.maximum(S_X, np.abs(wx).sum(axis=0))
-        n_ops = C0 + 1 + 3 * k + len(ids) + 1
+        n_ops = C0 + 1 + 5 * k + len(ids) + 1
         assert np.all(np.abs(Wr - W) <= n_ops * EPS64 * S_W), k
         assert np.all(np.abs(xr * Wr - WX) <= (n_ops + 2) * EPS64 * S_X), k
 
@@ -193,18 +260,21 @@ def _assert_parent_state(trace, table, outside) -> None:
 def _check_fp32(name: str):
     stats, eng_trace, table, ref_events, ref_trace, ref_tree = _run_cached(name, FP32, jnp.float32)
     assert stats.n_flagged_used_unrescored == 0
-    # exhaustive rounds (bounds off): every pair of the current children is freshly scored before each decision
-    sizes = [(len(e[0]), len(e[1])) for e in eng_trace if e[0]]
-    assert all(m == c * (c - 1) // 2 for m, c in sizes) and stats.n_pair_scores == sum(m for m, _ in sizes)
+    # exhaustive rounds (bounds off): every pair of the current children is freshly scored before each decision; in a
+    # special-child round (counter < 0, A18b) every pair with the special child: C − 1
+    sizes = [(len(e[0]), len(e[1]), e[4] < 0) for e in eng_trace if e[0]]
+    assert all(m == (c - 1 if sub else c * (c - 1) // 2) for m, c, sub in sizes)
+    assert stats.n_pair_scores == sum(m for m, _, _ in sizes)
     _assert_reopt_schedule(eng_trace, stats.events, len(eng_trace[0][1]), name != "nonroot")
     _assert_parent_state(eng_trace, table, _fixture(name)[2])
     d = _first_divergence(ref_events, stats.events)
-    last = len(ref_trace) - 1 if d is None else d
+    dr = _divergence_round(ref_trace, eng_trace)
+    last = len(ref_trace) - 1 if dr is None else dr
     # the engine's score of each chosen pair is within its derived resolution of the reference's
     assert merge_resolution_violations(ref_trace[: last + 1], eng_trace[: last + 1], table, FP32.mode) == []
     k_star = first_near_tie(ref_trace[: last + 1], eng_trace[: last + 1], ref_tree, table, FP32.mode)
-    print(f"{name}: first near-tie {k_star}, first divergence {d}, rounds {len(ref_trace)}")
-    assert d is None or k_star <= d  # a divergence needs a near-tie at or before it
+    print(f"{name}: first near-tie {k_star}, first divergence {dr} (event {d}), rounds {len(ref_trace)}")
+    assert (dr is None) == (d is None) and (dr is None or k_star <= dr)  # a divergence needs a near-tie at or before it
     if name in MIN_K_STAR:
         assert k_star >= MIN_K_STAR[name]
 

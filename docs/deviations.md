@@ -155,7 +155,12 @@
   (1e-4) during candidate search (TH:1303). Because the search is otherwise a free choice
   among positive-gain pairs, the engine's score for a given pair is typically at least upstream's
   score for the same pair (up to rounding, when both reach the same optimum), so it can pick a
-  different, higher-scoring pair and so a different merge order than upstream on the same data.
+  different, higher-scoring pair and so a different merge order than upstream on the same data. The fp64
+  reference (`bonsai._ref.pair`) does the same. Measured (supervisor diagnostic, 2026-10-28) on 2,198 round-0 pairs
+  of `bm_tree` families: `_ref.pair` reaches the brute-force optimum to ≤ 6e-14, while upstream's `calcSingleDLogL`
+  (L-BFGS-B, tol 1e-4 relative, |f| ~ 50–75) falls short by > 1e-3 on 70% and by > 1e-2 on 11% of the pairs (max
+  35.5) and turns 39 positive pairs non-positive. In an 80-run small-fixture sweep (C = 8, 10) all 6 merge-sequence
+  differences from upstream are of this kind, with the reference picking the true best pair (~1.3% of rounds).
 - When neither the sequential nor the joint 3-leaf solve converges for a pair, the engine returns
   the sequential solve's iterate flagged not converged, so a later host re-score can still use it;
   upstream's pair score in that situation is `-inf` and the pair is treated as having no finite
@@ -197,20 +202,33 @@ re-optimisation at the root every max(⌊0.05·C⌋, 10) merges (TH:1154, 2354),
   t_aR ≈ 0), where the branch would fire often and change the search. The engine therefore drops it: a round merges
   the best pair iff its dLogL > 1e-6, whatever its t_aR. Emulating the loose solve was rejected because it cannot be
   reproduced exactly.
-- Add-as-child as a zero edge, deferred collapse. When t_1a < 1e-6 and child 1 is internal, upstream makes child 2 a
-  child of child 1 and then tries one extra merge of child 2 among child 1's children (`mergeDownstreamChildrenSingle`,
-  TH:2467-2476, 2636-2641); likewise for child 2. The engine creates the new node anyway and sets that edge to exactly
-  0, with the same condition and order (child 1, the lower id, first). A zero edge passes child 1's message unchanged,
-  so the parent's state equals upstream's. Redo starry first collapses every zero edge above an internal non-cell node
-  (upstream's `mergeZeroTimeChilds`, TH:789-807), which turns child 1's children plus child 2 into one polytomy that is
-  resolved over all pairs; this replaces upstream's single extra merge, which is dropped. For t_1a = 0 this is the same
-  tree; for 0 < t_1a < 1e-6 it moves that time by less than 1e-6, as upstream itself does.
-- Repeated redo-starry passes. Upstream runs one redo-starry pass. A pass can leave new zero edges (a snap as above,
-  an exact-zero optimum, or a star re-optimisation that puts an internal child's time at 0), so the engine repeats
-  collapse + pass while any live internal non-cell node has t == 0, up to 8 passes; passes after the first run the
-  greedy only at the nodes the collapse gave children. Every merge raises the likelihood by more than 1e-6, so the
-  passes terminate; hitting the cap emits a `RuntimeWarning` and returns the (valid) tree with those zero edges. The
-  greedy-stage tree is written from a copy with zero edges collapsed, as upstream's `cleanup_tree` does (DP:354-355).
+- Add-as-child as a zero edge, resolved at once. When t_1a < 1e-6 and child 1 is internal, upstream makes child 2 a
+  child of child 1 (`mergeNodes`, TH:2467-2476, 2548, 2572-2575) and then immediately runs a special-child greedy at
+  child 1 (`mergeDownstreamChildrenSingle` → `mergeChildrenRecursiveSingle` → `mergeChildrenUB(specialChild=child 2)`,
+  TH:935-966, 1015-1036, 2637-2641): only pairs of child 2 with child 1's other children (TH:1631), bounds and kNN off
+  (TH:2293, 2306), at most one merge (expNChild = max(C − 1, 2), TH:2301), and that merge may itself be an
+  add-as-child and recurse (mergeDownstream=True, TH:1467); likewise for child 2. The root greedy and redo starry both
+  run with mergeDownstream=True (MA:177-180, 234-237). The engine and the reference reproduce this (A18b): they create
+  the new node, set that edge to exactly 0 under the same condition and order (child 1, the lower id, first), collapse
+  it at once (child 1's children move to the new node) and run the same special-child greedy there, recursively, with
+  the new node's outside message from its parent. For t_1a = 0 this is upstream's tree; for 0 < t_1a < 1e-6 it moves
+  that time by less than 1e-6, as upstream itself does. Remaining differences: (i) node ids. Upstream's receiving
+  child keeps its nodeInd, the engine's new node gets the next id, so "child 1 = the lower id" can name a different
+  child after a snap; this matters only when both children of a merged pair are internal with t < 1e-6, and for
+  exact score ties. In the special-child greedy upstream scans the pairs (special, c) in its child-list order (the
+  receiver's children in insertion order, the moved child last, TH:1631) and keeps the first maximum (strict >,
+  TH:1342), so on an exactly equal score the earlier-inserted c wins; the engine and the reference take the lower
+  canonical pair (i, j), as in every other round (A20). (ii) The A21b no-zero-root rule also applies inside the special-child greedy (upstream's
+  `resetChildTimes` path, armed there from the first round, TH:2352-2353, 2408-2423, 1426, practically never fires
+  either). The reference's merge sequence equals upstream's over whole runs on the slow-test fixtures, nested snaps
+  included.
+- Repeated redo-starry passes. Upstream runs one redo-starry pass. With snaps resolved inside the merge, a pass can
+  still leave a zero edge from an exact-zero optimum or a star re-optimisation that puts an internal child's time at 0,
+  so the engine repeats collapse + pass while any live internal non-cell node has t == 0, up to N − 1 passes (A18b;
+  each pass strictly shrinks the zero-edge leaf sets, and every merge raises the likelihood by more than 1e-6); passes
+  after the first run the greedy only at the nodes the collapse gave children. Hitting the cap emits a
+  `RuntimeWarning` and returns the (valid) tree with those zero edges. The greedy-stage tree is written from a copy
+  with zero edges collapsed, as upstream's `cleanup_tree` does (DP:354-355).
 - Redo-starry visiting order. Like upstream's recursion (children before their parent, TH:902-929, 968-1012), redo
   starry visits the nodes in post-order, but it takes the children by increasing node id where upstream takes them
   in its child-list order. That list is insertion order, and after `mergeZeroTimeChilds` the promoted grandchildren

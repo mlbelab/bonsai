@@ -13,6 +13,7 @@ with the A19 rebuild schedule; ``merges_per_round`` at the root (A20). A merge w
 rounding resolution of the 1e-6 threshold is decided on the fp64 host re-score (A24).
 """
 
+import dataclasses
 import time
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -39,8 +40,14 @@ REDO_NN_FRAC, REDO_NN_MIN = 0.1, 10  # kNN rebuild schedule (TH:1951, A19); Task
 NN_MIN_CHILDREN = 50  # kNN only when C > 50 (MA:176, TH:1888); Task 6b
 LAZY_MIN_CHILDREN = 10  # bounds only when C > 10 (TH:1040); Task 6b
 STAR_TOL, STAR_MAX_SWEEPS = 1e-4, 1000  # star EM, with STAR_T_MAX = 1e8 (TH:4992-5004)
-ZERO_EDGE_PASSES = 8  # cap on collapse + redo passes (A18); Task 7
 K_NN = 10  # use_knn (config.py:75); Task 6b
+SPECIAL_BATCH = 16  # rows per device batch in a special-child round (A18b: C − 1 pairs, usually 2-10)
+
+
+def max_passes(n_cells: int) -> int:
+    """Redo-starry pass cap N − 1 (A18b): each pass strictly shrinks the zero-edge leaf sets."""
+    return max(n_cells - 1, 1)
+
 
 __all__ = [
     "STAR_T_MAX",
@@ -48,6 +55,7 @@ __all__ = [
     "GreedyStats",
     "NodeTable",
     "greedy_star",
+    "max_passes",
     "pair_round_resolution",
     "select_candidate",
 ]
@@ -81,6 +89,23 @@ class GreedyStats(NamedTuple):
     n_false_stop_events: int = 0  # of those, stops with at least one band row whose fp64 d > 1e-6
     n_band_rows: int = 0  # candidates re-scored on the host at stops (inside the resolution band)
     stop_check_s: float = 0.0  # wall time spent in the diagnostic
+
+
+# greedy_star's counter keys -> GreedyStats fields
+_STAT_FIELDS = {
+    "scores": "n_pair_scores",
+    "host": "n_host_rescored",
+    "batches": "n_rescore_batches",
+    "rescored": "n_rescored",
+    "rebuilds": "n_rebuilds",
+    "reopts": "n_reopts",
+    "unrescored": "n_flagged_used_unrescored",
+    "thr": "n_threshold_rescored",
+    "stop": "n_stop_events",
+    "false": "n_false_stop_events",
+    "band": "n_band_rows",
+    "stop_s": "stop_check_s",
+}
 
 
 @eqx.filter_jit(donate="all")
@@ -258,7 +283,14 @@ def _movement(old, new) -> tuple[float, float]:
 
 
 def greedy_star(
-    table: NodeTable, p: int, outside, is_root: bool, cfg: GreedyConfig = GreedyConfig(), trace: list | None = None
+    table: NodeTable,
+    p: int,
+    outside,
+    is_root: bool,
+    cfg: GreedyConfig = GreedyConfig(),
+    trace: list | None = None,
+    special: int | None = None,
+    depth: int = 0,
 ) -> GreedyStats:
     r"""Greedily merge the children of ``p`` in place (maths ref §8; ``_ref.greedy.greedy_star`` semantics).
 
@@ -274,15 +306,25 @@ def greedy_star(
     re-optimisation and once before stopping; a new node's pairs come from an exact ``knn_query`` into a freed row.
     At the root up to m − 1 = ``cfg.merges_per_round`` − 1 further fresh, disjoint pairs with dLogL > 1e-6 are merged
     in the same round, by (d desc, ij asc), with their stored times. Stops at ≤ 3 children (root) / ≤ 2 (other).
+    A snap is upstream's add-as-child, resolved at once as in ``_ref.greedy`` (A18b): the receiving child is collapsed
+    into the new node a, and ``greedy_star(a, special=m, depth + 1)`` runs on a's star (its children plus the moved
+    child m) with a's outside message from p's accumulator. As upstream's special-child greedy (TH:1631, 2293, 2306,
+    2301) it scores only the pairs (m, c), exhaustively (bounds and kNN off), and merges at most one pair, which may
+    snap and recurse again. a's contribution to p's accumulator is then replaced, and the whole merge is one parent
+    move (A20). ``events`` and ``trace`` are flat in execution order, counter −depth in a special-child round; the
+    returned counts include the nested calls.
     ``trace``: as ``_ref.greedy``, one entry per round before the decision, (scores {(i, j): (dLogL, t3, host, x_R,
     v_R)} of the fresh candidates, {child: t}, x_r, W_r, counter) with (x_r, W_r) the float64 AIR, ``host`` whether
     the score is the fp64 host re-score, (x_R, v_R) the rest as sent to the device; re-optimisation rounds have no
     scores. p's row ends with its message from its children.
     """
+    if special is not None:  # upstream's specialChild greedy: bounds and kNN off (TH:2293, 2306)
+        cfg = dataclasses.replace(cfg, knn=False, lazy=False)
     mode, M = cfg.mode, cfg.rescore_top
     m = cfg.merges_per_round if is_root else 1
     dt = table.dtype
     kids = table.children(p)
+    stop = (3 if is_root else 2) if special is None else max(len(kids) - 1, 2)  # expNChild (TH:2301)
     events: list[Event] = []
     n = {
         "scores": 0,
@@ -418,7 +460,9 @@ def greedy_star(
             kind, idx = select_candidate(store.d, store.ub(mv["Dx"], mv["DW"]), store.epoch == mv["epoch"], store.ij, M)
             if kind != "rescore":
                 return int(idx[0]) if kind == "accept" else None
-            score(idx, M)
+            B = M if special is None else SPECIAL_BATCH  # a special round has only C − 1 pairs
+            for k in range(0, len(idx), B):
+                score(idx[k : k + B], B)
             n["batches"] += 1
             n["rescored"] += len(idx)
 
@@ -431,6 +475,8 @@ def greedy_star(
         store.add(np.c_[new // cap, new % cap])
 
     def all_pairs() -> np.ndarray:
+        if special is not None:  # (TH:1631)
+            return np.array([(min(special, c), max(special, c)) for c in kids if c != special], np.int64).reshape(-1, 2)
         return np.array([(c1, c2) for k, c1 in enumerate(kids) for c2 in kids[k + 1 :]], np.int64).reshape(-1, 2)
 
     def coords(ids) -> np.ndarray:
@@ -487,13 +533,28 @@ def greedy_star(
             rebuild()  # A19: after every re-optimisation
         score_new()
 
+    def sub_greedy(a: int, recv: int, moved: int) -> None:
+        """A18b: collapse the snapped edge (recv's children move to a), then the special-child greedy at a."""
+        table.parent[np.flatnonzero(table.parent[: table.n] == recv)] = a
+        table.parent[recv] = -2
+        w, xa = table.weights64(a), table.x64(a)
+        W_ex = acc.W - w  # > 0: p keeps another child or its outside message
+        x_ex = (acc.WX - w * xa) / W_ex
+        s = greedy_star(table, a, (x_ex, 1.0 / (table.t[a] + 1.0 / W_ex)), False, cfg, trace, moved, depth + 1)
+        acc.remove(w, xa)  # a's message changed: replace its contribution (TH:950-957)
+        acc.add(table.weights64(a), table.x64(a))
+        events.extend(s.events)
+        for key, field in _STAT_FIELDS.items():
+            n[key] += getattr(s, field)
+
     def merge(i: int, j: int, t3, dlogl: float) -> None:
         nonlocal kids, since
         t1a, t2a, t_ar = (float(u) for u in t3)
+        recv = None  # the receiving child of an add-as-child snap
         if t1a < ADD_AS_CHILD_T and not table.is_cell[i]:  # child 1 first (TH:2467-2476, A18)
-            t1a = 0.0
+            t1a, recv = 0.0, i
         elif t2a < ADD_AS_CHILD_T and not table.is_cell[j]:
-            t2a = 0.0
+            t2a, recv = 0.0, j
         x2, v2 = table.x64([i, j]), table.v64([i, j])
         xa, Wa = ref_star.node_message(x2, v2, np.array([t1a, t2a]))  # host fp64, rounded once by add
         old = acc.message()
@@ -503,8 +564,10 @@ def greedy_star(
         table.parent[[i, j]] = a
         table.t[i], table.t[j] = t1a, t2a
         acc.add(table.weights64(a), table.x64(a))
+        events.append(Event("merge", i, j, a, dlogl, (t1a, t2a, t_ar), depth))
+        if recv is not None:
+            sub_greedy(a, recv, j if recv == i else i)
         move(old)
-        events.append(Event("merge", i, j, a, dlogl, (t1a, t2a, t_ar)))
         kids = [c for c in kids if c not in (i, j)]
         store.drop([i, j])
         since += 1
@@ -546,7 +609,7 @@ def greedy_star(
         store.add(all_pairs())
     score_new()
     counter, redo_at = 0, max(int(REDO_TIME_FRAC * len(kids)), REDO_TIME_MIN)
-    while len(kids) > (3 if is_root else 2):
+    while len(kids) > stop:
         if is_root and counter > redo_at:  # TH:1926-1927 (A21: on any round)
             if trace is not None:
                 trace.append(({}, {c: float(table.t[c]) for c in kids}, *acc.message(), counter))
@@ -564,7 +627,7 @@ def greedy_star(
             for r in fresh:
                 ij = (int(store.ij[r, 0]), int(store.ij[r, 1]))
                 scores[ij] = (store.d[r], store.t3[r].copy(), bool(store.host[r]), *sent[ij])
-            trace.append((scores, {c: float(table.t[c]) for c in kids}, *acc.message(), counter))
+            trace.append((scores, {c: float(table.t[c]) for c in kids}, *acc.message(), -depth if depth else counter))
         if best is None or not store.d[best] > ACCEPT_DLOGL:
             if nn is not None and since > 0:  # A19: one rebuild before stopping
                 rebuild()
@@ -580,18 +643,4 @@ def greedy_star(
     xp, Wp = ref_star.node_message(table.x64(kids), table.v64(kids), table.t[kids])
     table.x[p], table.v[p] = xp, 1.0 / Wp
     table.sync(p)
-    return GreedyStats(
-        events,
-        n["scores"],
-        n["host"],
-        n["batches"],
-        n["rescored"],
-        n["rebuilds"],
-        n["reopts"],
-        n["unrescored"],
-        n["thr"],
-        n["stop"],
-        n["false"],
-        n["band"],
-        n["stop_s"],
-    )
+    return GreedyStats(events, **{field: n[key] for key, field in _STAT_FIELDS.items()})

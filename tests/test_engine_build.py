@@ -8,6 +8,7 @@ import pytest
 from bench.run import count_compilations
 
 from bonsai._engine import build
+from bonsai._engine import greedy as eg
 from bonsai._engine.build import collapse_zero_edges, greedy_tree, redo_starry
 from bonsai._engine.greedy import ACCEPT_DLOGL, GreedyConfig, NodeTable
 from bonsai._ref import greedy as rg
@@ -38,7 +39,7 @@ def _names(n: int) -> list[str]:
 
 
 def _key(e):
-    return (e.kind, e.i, e.j, e.new)
+    return (e.kind, e.i, e.j, e.new, e.depth)
 
 
 def _clades(parent, t, n_leaves: int) -> dict:
@@ -184,12 +185,12 @@ def test_built_tree_scorable_and_newick_round_trip(built11):
 
 
 def test_no_internal_zero_edges_after_redo(built11):
-    """On seed 11 (the plan's fixture) the greedy snaps internal children (A18) and redo starry needs a second pass;
-    afterwards no non-root internal edge has t == 0, the greedy snapshot has none either, passes ≤ 8."""
+    """On seed 11 (the plan's fixture) the greedy snaps internal children (A18), each resolved inside its merge by a
+    special-child greedy (A18b); no non-root internal edge has t == 0 afterwards, nor in the greedy snapshot."""
     _, _, b, _ = built11
     ev = b.stats["events"]
     snaps = [e for e in ev if e.kind == "merge" and ((e.t[0] == 0 and e.i >= N) or (e.t[1] == 0 and e.j >= N))]
-    assert snaps and b.stats["zero_edges_collapsed"] > 0 and 1 < b.stats["passes"] <= 8  # preconditions
+    assert snaps and any(e.depth for e in ev)  # preconditions
     internal = np.isin(np.arange(len(b.parent)), b.parent)
     assert not np.any(internal & (b.parent >= 0) & (b.t == 0))
     p, t, _ = parse_newick(b.stage_newick["greedy"])
@@ -362,15 +363,81 @@ def test_redo_pass_order_and_outside_messages(monkeypatch):
     assert any(a in anc(b) for a in expected for b in expected)
 
 
-def test_pass_cap_warns_and_returns_collapsed_tree(monkeypatch):
-    """Seed 11 needs 2 passes (``test_no_internal_zero_edges_after_redo``); with the cap at 1 redo starry warns, and the
+@pytest.mark.parametrize("n_zero", [1, 9])
+def test_pass_cap_warns_and_returns_collapsed_tree(monkeypatch, n_zero):
+    """Passes repeat while a zero edge remains, up to N − 1 = 23 (A18b): each of the first ``n_zero`` redo passes is
+    wrapped to leave an exact-zero edge above a live internal node (as an exact-zero optimum would), so n_zero + 1
+    passes are needed (9 → 10 > the withdrawn cap 8). With the cap at 1 (n_zero = 1) redo starry warns, and the
     returned tree and its newick are still collapsed (no internal zero edge, as upstream's cleanup_tree)."""
-    monkeypatch.setattr(build, "ZERO_EDGE_PASSES", 1)
+    real, zeroed = build._redo_pass, []
+
+    def pass_then_zero(table, root, touched, cfg):
+        out = real(table, root, touched, cfg)
+        if len(zeroed) < n_zero:
+            p = table.parent[: table.n]
+            internal = np.isin(np.arange(table.n), p) & (p >= 0) & ~table.is_cell[: table.n]
+            zeroed.append(int(np.flatnonzero(internal)[0]))
+            table.t[zeroed[-1]] = 0.0
+        return out
+
+    monkeypatch.setattr(build, "_redo_pass", pass_then_zero)
+    assert build.max_passes(N) == N - 1
     x, var = _leaves(N, 11)
-    with pytest.warns(RuntimeWarning, match="zero edges remain"):
+    if n_zero == 1:
+        monkeypatch.setattr(build, "max_passes", lambda n: 1)
+        with pytest.warns(RuntimeWarning, match="zero edges remain after 1 passes"):
+            b = greedy_tree(x, var, _names(N))
+        assert b.stats["passes"] == 1
+    else:
         b = greedy_tree(x, var, _names(N))
-    assert b.stats["passes"] == 1
+        assert b.stats["passes"] == n_zero + 1 and len(zeroed) == n_zero
     internal = np.isin(np.arange(len(b.parent)), b.parent)
     assert not np.any(internal & (b.parent >= 0) & (b.t == 0))
     p, t, _ = parse_newick(b.stage_newick["redo_starry"])
     assert not np.any(np.isin(np.arange(len(p)), p) & (p >= 0) & (t == 0))
+
+
+def test_special_child_greedy_merges_at_most_once(monkeypatch):
+    """A18b, both arms: the special-child greedy scores only the moved child's pairs and merges at most one pair
+    (expNChild = max(C − 1, 2), TH:2301, 1596), then the root greedy continues.
+
+    Root 10: cells 0, 1, 2, internal 8 (cells 3, 4, 5) and 9 (cells 6, 7). Forced scores (1e3, above every other
+    pair): the root merges (1, 8) with t_2a = 5e-7, a snap, so 8 collapses into 11 (star 1, 3, 4, 5, special 1); there
+    (1, 3) and (1, 4) tie at 1e3, (1, 3) is merged (lower ids) and the greedy stops: the next round is the root's.
+    """
+    parent = np.array([10, 10, 10, 8, 8, 8, 9, 9, 10, 10, -1])
+    rng = np.random.default_rng(7)
+    x, var = rng.normal(size=(11, G)), rng.uniform(0.05, 0.3, (11, G))
+    tree = _from_tree(parent, np.r_[rng.uniform(0.2, 1.0, 10), 0.0], x, var)
+    table = _table(tree, jnp.float32)
+    forced = {(1, 8): (0.3, 5e-7, 0.5), (1, 3): (0.3, 0.4, 0.2), (1, 4): (0.3, 0.4, 0.2)}
+    real_ref, real_dev = rg.pair_score, eg.pair_score
+
+    def ref_score(x1, v1, t1, x2, v2, t2, xr, Wr, mode="sequential"):
+        s = real_ref(x1, v1, t1, x2, v2, t2, xr, Wr, mode)
+        for (i, j), t3 in forced.items():
+            if np.array_equal(x1, tree.x[i]) and np.array_equal(x2, tree.x[j]):
+                return s._replace(dlogl=1e3, t=np.array(t3))
+        return s
+
+    def dev_score(*args, **kw):
+        s = real_dev(*args, **kw)
+        d, t = np.array(s.dlogl), np.array(s.t)
+        for (i, j), t3 in forced.items():
+            hit = np.all(np.asarray(args[0]) == table.x[i], axis=1) & np.all(np.asarray(args[3]) == table.x[j], axis=1)
+            d[hit], t[hit] = 1e3, t3
+        return s._replace(dlogl=jnp.asarray(d), t=jnp.asarray(t))
+
+    monkeypatch.setattr(rg, "pair_score", ref_score)
+    monkeypatch.setattr(eg, "pair_score", dev_score)
+    ref_trace: list = []
+    _, ref_events = rg.greedy_star(tree, 10, None, trace=ref_trace)
+    eng_trace: list = []
+    stats = eg.greedy_star(table, 10, None, True, GreedyConfig(knn=False, lazy=False), trace=eng_trace)
+    assert [_key(e) for e in stats.events] == [_key(e) for e in ref_events]
+    for events, trace in ((ref_events, ref_trace), (stats.events, eng_trace)):
+        assert [_key(e) for e in events[:2]] == [("merge", 1, 8, 11, 0), ("merge", 1, 3, 12, 1)] and events[0].t[1] == 0
+        assert events[2].depth == 0  # back at the root (its later rounds may snap again)
+        sub = trace[1]  # the one special-child round; the next round is the root's
+        assert sub[4] == -1 and trace[2][4] >= 0
+        assert set(sub[0]) == {(1, 3), (1, 4), (1, 5)} and set(sub[1]) == {1, 3, 4, 5}
