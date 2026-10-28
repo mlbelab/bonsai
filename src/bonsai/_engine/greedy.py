@@ -122,11 +122,21 @@ class NodeTable:
         """New internal node with message (x64, v64), rounded once to the compute dtype; returns its id."""
         a = self.n
         if a == len(self.parent):
-            raise ValueError("NodeTable is full")
+            self._grow()
         self.x[a], self.v[a] = x64, v64
         self.parent[a], self.t[a], self.n = parent, t, a + 1
         self.sync(a)
         return a
+
+    def _grow(self) -> None:
+        """Reallocate every array at the next bucket (ids are never reused, so redo starry can exceed 2N+1)."""
+        old, cap = len(self.parent), _bucket(len(self.parent) + 1)
+        for name, fill in (("parent", -2), ("t", 0), ("is_cell", False), ("x", 0), ("v", 1)):
+            a = getattr(self, name)
+            b = np.full((cap, *a.shape[1:]), fill, a.dtype)
+            b[:old] = a
+            setattr(self, name, b)
+        self.dev_x, self.dev_v = jnp.asarray(self.x), jnp.asarray(self.v)
 
     def sync(self, a: int) -> None:
         """Copy host row ``a`` (x, v) to the device mirror."""
@@ -272,7 +282,6 @@ def greedy_star(
     mode, M = cfg.mode, cfg.rescore_top
     m = cfg.merges_per_round if is_root else 1
     dt = table.dtype
-    cap = len(table.parent)
     kids = table.children(p)
     events: list[Event] = []
     n = {
@@ -415,6 +424,7 @@ def greedy_star(
 
     def set_candidates(ij: np.ndarray) -> None:
         """Candidate set := the canonical pairs ``ij``; retained pairs keep their stored scores, new ones unscored."""
+        cap = len(table.parent)  # live: the table may have grown since the last call
         key, have = ij[:, 0] * cap + ij[:, 1], store.ij[:, 0] * cap + store.ij[:, 1]
         store.keep(np.isin(have, key))
         new = np.setdiff1d(key, have)

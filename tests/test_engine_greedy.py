@@ -353,3 +353,46 @@ def test_near_tie_rule_on_host_rescored_rows():
     explicit = (*host[:8], xR, 1.0 / WR)
     s = scores[p1]
     assert _snap_resolution(host, s, 0, "sequential", 1e-7) == _snap_resolution(explicit, s, 0, "sequential", EPS64)
+
+
+def test_node_table_grows_when_ids_exceed_capacity():
+    """Ids are never reused, so redo starry can run past 2N+1: a table started at N+2 rows grows (bucketed) and the
+    run is identical to one with ample capacity: same ids, events, parents, times and device mirror."""
+    x, var, _ = _fixture("seed12")
+    x, var = x[:12], var[:12]
+    cfg = GreedyConfig(knn=False, lazy=False)
+    tables, events = [], []
+    for cap in (None, 14):
+        table = NodeTable(x, var, cap=cap)
+        table.t[:12] = star_em(x, var)[0]
+        events.append([_key(e) for e in greedy_star(table, 12, None, True, cfg).events])
+        tables.append(table)
+    full, small = tables
+    assert len(full.parent) == 32 and len(small.parent) == 32 and small.n == 22  # grown 14 -> 16 -> 32
+    assert events[0] == events[1] and len(events[0]) == 9
+    np.testing.assert_array_equal(small.parent, full.parent)
+    np.testing.assert_array_equal(small.t, full.t)
+    np.testing.assert_array_equal(small.x, full.x)
+    np.testing.assert_array_equal(small.v, full.v)
+    np.testing.assert_array_equal(small.is_cell, full.is_cell)
+    np.testing.assert_array_equal(np.asarray(small.dev_x), small.x)
+    np.testing.assert_array_equal(np.asarray(small.dev_v), small.v)
+
+
+@pytest.mark.slow
+def test_node_table_growth_with_knn_candidate_keys():
+    """52 leaves with kNN on (C > 50): ``set_candidates(all_pairs())`` runs at C = 50, where the next id (54) equals
+    the starting capacity N+2. Pair keys i*cap+j must use the live capacity, or pairs collide after the growth."""
+    _, _, x, var = bm_tree(52, G, np.random.default_rng(21))
+    x, var = x[:52].copy(), var[:52].copy()
+    x = x - x.mean(axis=0)
+    cfg = GreedyConfig()
+    out = []
+    for cap in (None, 54):
+        table = NodeTable(x, var, cap=cap)
+        table.t[:52] = star_em(x, var, tol=cfg.star_tol)[0]
+        out.append((table, [_key(e) for e in greedy_star(table, 52, None, True, cfg).events]))
+    (full, ev_full), (small, ev_small) = out
+    assert len(small.parent) > 54 and small.n > 54  # grew
+    assert ev_small == ev_full and len(ev_full) > 0
+    np.testing.assert_array_equal(small.parent[: small.n], full.parent[: full.n])
