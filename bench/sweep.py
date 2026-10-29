@@ -285,7 +285,7 @@ def render(rows: list[dict], dec: dict, upstream_rows: list[dict], timings: dict
     arms = [[r["case"], r["setting"], a]
             + [_f(r["arms"][a]["L_raw_stage"]["greedy"], "{:.8g}"), _f(r["arms"][a]["L_raw_stage"]["redo_starry"], "{:.8g}"),
                r["arms"][a]["retime"]["status"], _f(r["arms"][a]["retime"]["gap"], "{:.3e}"), _f(r["arms"][a]["retime"]["sum_abs_pg"], "{:.3e}"),
-               str(r["arms"][a]["retime"]["cg_iters"]), str(r["arms"][a]["retime"]["restarts"]), _f(r["arms"][a].get("retime_cache_hit"))]
+               _f(r["arms"][a]["retime"].get("n_flat")), str(r["arms"][a]["retime"]["restarts"]), _f(r["arms"][a].get("retime_cache_hit"))]
             for r in done for a in ("jax", "upstream")]  # fmt: skip
     stats = [[r["case"], r["setting"], *(_f(r["stats"][k]) for k in ("n_stop_events", "n_false_stop_events", "n_band_rows", "stop_check_s")),
               _f(r["greedy_s"], "{:.1f}")] for r in done]  # fmt: skip
@@ -328,7 +328,7 @@ def render(rows: list[dict], dec: dict, upstream_rows: list[dict], timings: dict
                 "retime",
                 "gap",
                 "sum|pg|",
-                "cg_iters",
+                "n flat",
                 "restarts",
                 "cache hit",
             ],

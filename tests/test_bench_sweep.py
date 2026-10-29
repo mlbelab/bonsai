@@ -222,7 +222,7 @@ def test_resolve_upstream_needs_exactly_one_dir(tmp_path, monkeypatch):
 def _arm(hit):
     return {
         "L_raw_stage": {"greedy": -9.0, "redo_starry": -8.0},
-        "retime": {"L": -100.0, "status": "converged", "gap": 1e-5, "sum_abs_pg": 1e-9, "cg_iters": 7, "restarts": 1},
+        "retime": {"L": -100.0, "status": "converged", "gap": 1e-5, "sum_abs_pg": 1e-9, "restarts": 1},
         "retime_cache_hit": hit, "quartet_accuracy": 0.9, "quartet_accuracy_raw": 0.95, "rf_normalised": 0.1, "rf_normalised_raw": 0.05,
     }  # fmt: skip
 

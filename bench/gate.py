@@ -4,9 +4,18 @@
 [--device IDX] [--retime-cache DIR]``, or ``--upstream-only`` (no ``--jax``; re-times just the upstream arm
 into the cache, ``--retime-cache`` required).
 
-``--retime-cache DIR`` stores each ``RetimeResult`` under a sha256 of the tree, ``leaf_sha256`` and the
-``bench.retime`` constants, so an identical tree is re-timed once across runs; writes are atomic
-(concurrent array tasks may duplicate work, never corrupt an entry).
+``--retime-cache DIR`` stores each re-time's L-BFGS endpoint (``bench.retime.Endpoint``, whatever its status) under a
+sha256 of the tree, ``leaf_sha256``, the L-BFGS constants and box, and the code hash of the endpoint computation
+(``code_hash``), so an identical tree runs L-BFGS once across runs; the A16f acceptance is memoised separately under
+(endpoint key, endpoint, ``acceptance_hash``), so it reruns whenever the acceptance code changes. Entries written before A16f (converged results only, keyed with the A16e
+constants and code hash) are read as endpoints and migrated to the new key. Writes are atomic (concurrent array tasks
+may duplicate work, never corrupt an entry).
+
+``python -m bench.gate --recheck --manifest W.tsv [--lines 0,3-5] [--device IDX]`` re-evaluates every existing
+gate/upstream report of the manifest (or of the given manifest ids; bench/slurm/gate.sbatch has a per-line recheck mode) whose stored
+``acceptance_hash`` differs from the current one, from the cached endpoints under A16f, and rewrites it with
+``acceptance: "A16f"`` and the current ``acceptance_hash``, keeping the previous
+report under ``superseded``.
 
 Both arms' redo-starry trees are re-timed by the same float64 re-timer (``bench.retime``, in a
 ``JAX_ENABLE_X64=1`` subprocess) on the same leaf arrays, then compared by A1 (re-timed L per
@@ -21,6 +30,7 @@ results folder); ``leaf_sha256`` stays a strict integrity check.
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -41,8 +51,9 @@ from bonsai._ref.tree import tree_loglik
 
 from . import metadata, retime
 from .metrics import contract_zero_edges, quartet_accuracy, rf_distance
-from .retime import RetimeResult, load
+from .retime import Endpoint, RetimeResult, load
 from .run import _GREEDY_FOLDER, _leaf_arrays, _write_json, leaf_sha256, load_data
+from .sweep import read_manifest
 
 A1_MIN_PER_ENTRY = -1e-6  # A1: (L_jax − L_up)/(N·G) ≥ −1e-6
 A7_MIN_DIFF = -0.01  # A7: quartet accuracy at most 1 percentage point below upstream
@@ -60,84 +71,176 @@ def gate_verdict(L_jax, L_up, n_cells, n_genes, q_jax=None, q_up=None) -> dict:
     }
 
 
-def retime_subprocess(parent, t, x, var, device: str | None = None) -> RetimeResult:
-    """``bench.retime`` in a ``JAX_ENABLE_X64=1`` subprocess (on GPU ``device`` if given)."""
+def retime_subprocess(parent, t, x, var, device: str | None = None, endpoint: Endpoint | None = None):
+    """(RetimeResult, Endpoint) of ``bench.retime`` in a ``JAX_ENABLE_X64=1`` subprocess (on GPU ``device`` if given).
+
+    With ``endpoint`` the subprocess skips L-BFGS and only runs the A16f acceptance on it. If the subprocess fails
+    after L-BFGS, the raised ``CalledProcessError`` carries the saved endpoint as ``.endpoint`` (else ``None``).
+    """
     env = dict(os.environ, JAX_ENABLE_X64="1")
     if device is not None:
         env.update(CUDA_VISIBLE_DEVICES=str(device), XLA_PYTHON_CLIENT_PREALLOCATE="false")
+    ep = {} if endpoint is None else {f"ep_{k}": v for k, v in asdict(endpoint).items()}
     with tempfile.TemporaryDirectory(prefix="bonsai_retime_") as d:
         inp, out = Path(d) / "in.npz", Path(d) / "out.npz"
-        np.savez(inp, parent=parent, t=t, x=x, var=var)
-        subprocess.run(
-            [sys.executable, "-m", "bench.retime", str(inp), str(out)], cwd=metadata.REPO, env=env, check=True
-        )
+        np.savez(inp, parent=parent, t=t, x=x, var=var, **ep)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "bench.retime", str(inp), str(out)], cwd=metadata.REPO, env=env, check=True
+            )
+        except subprocess.CalledProcessError as err:  # keep a fresh endpoint saved before the acceptance failed
+            ep_f = Path(retime.endpoint_path(out))
+            err.endpoint = retime.load_endpoint(ep_f) if ep_f.exists() else None
+            raise
         return load(out)
 
 
-_KEY_CONSTANTS = (
-    "OPTIONS", "MAX_RESTARTS", "MAX_CG", "FD_H", "L_MATCH_REL", "GAP_FRAC",
-    "CG_GAP_REL", "CG_GAP_WINDOW", "CG_RES_GAP", "CG_RES", "CG_GAP_BOUND_FRAC", "CURV_REL",
+_KEY_CONSTANTS = ("OPTIONS", "MAX_RESTARTS", "GAP_FRAC")  # the L-BFGS options and the restart loop's bound
+_ENDPOINT_CODE = ("Endpoint", "times_of", "_objective", "_bound", "lbfgs")  # retime's endpoint computation
+_ACCEPT_CONSTANTS = ("GAP_FRAC", "L_MATCH_REL", "CURV_REL", "LG_ALPHA_MIN", "LG_GRID", "FLOOR_S", "OPTIONS")
+_ACCEPT_CODE = (
+    "RetimeResult", "times_of", "_objective", "_bound", "_grad_scale", "free_set", "line_gain", "joint_gain",
+    "gap_terms", "free_hessian", "eigh", "accept",
 )  # fmt: skip
+# The A16e key constants: entries written before A16f were keyed with these (and the A16e code hash they store).
+_A16E_CONSTANTS = {
+    "OPTIONS": {"ftol": 0.0, "gtol": 1e-12, "maxiter": 15000, "maxfun": 30000}, "MAX_RESTARTS": 10, "MAX_CG": 2000,
+    "FD_H": 1e-4, "L_MATCH_REL": 1e-10, "GAP_FRAC": 1e-2, "CG_GAP_REL": 1e-3, "CG_GAP_WINDOW": 50, "CG_RES_GAP": 1e-3,
+    "CG_RES": 1e-6, "CG_GAP_BOUND_FRAC": 0.1, "CURV_REL": 1e-10, "LOG_T_MIN": -15.0, "LOG_T_MAX": 15.0,
+}  # fmt: skip
 
 
 def code_hash() -> str:
-    """sha256 of the source of everything that computes a re-time.
+    """sha256 of the code that computes an endpoint (not the acceptance, A16f).
 
-    That is retime, the engine tree pass with its numerics and layout, and the reference tree with its newick
-    helpers; scipy and jax versions are pinned by uv.lock.
+    That is the source of retime's ``_ENDPOINT_CODE`` (the L-BFGS part and its objective), the engine tree pass with
+    its numerics and layout, and the reference tree (L_start, the bound's cell count) with its newick helpers; scipy
+    and jax versions are pinned by uv.lock.
     """
     h = hashlib.sha256()
-    for mod in (retime, engine_tree, numerics, array_tree, ref_tree, ref_newick):
+    for name in _ENDPOINT_CODE:
+        h.update(inspect.getsource(getattr(retime, name)).encode())
+    for mod in (engine_tree, numerics, array_tree, ref_tree, ref_newick):
         h.update(Path(mod.__file__).read_bytes())
     return h.hexdigest()
 
 
-def retime_key(parent, t, names, leaf_sha: str) -> str:
-    """sha256 of what determines a re-time.
+def acceptance_hash() -> str:
+    """sha256 of what decides an acceptance besides the endpoint.
 
-    The tree (t at full precision), the leaf data, the retime constants and box bounds, and the code hash.
+    That is retime's ``_ACCEPT_CODE`` sources and ``_ACCEPT_CONSTANTS``, and the engine/reference files (via
+    ``code_hash``).
     """
-    h = hashlib.sha256()
-    h.update(np.ascontiguousarray(parent, dtype=np.int64).tobytes())
-    h.update(np.ascontiguousarray(t, dtype=np.float64).tobytes())
-    consts = {k: getattr(retime, k) for k in _KEY_CONSTANTS} | {"LOG_T_MIN": LOG_T_MIN, "LOG_T_MAX": LOG_T_MAX}
-    h.update(json.dumps([list(names), leaf_sha, consts, code_hash()], sort_keys=True).encode())
+    h = hashlib.sha256(code_hash().encode())
+    for name in _ACCEPT_CODE:
+        h.update(inspect.getsource(getattr(retime, name)).encode())
+    h.update(json.dumps({k: getattr(retime, k) for k in _ACCEPT_CONSTANTS}, sort_keys=True).encode())
     return h.hexdigest()
 
 
-def _load_entry(f: Path, code: str) -> RetimeResult | None:
-    """The cached result, or ``None`` (a miss).
+def _acceptance_file(cache_dir, key: str, ep: Endpoint) -> Path:
+    """The memoised acceptance of endpoint ``ep`` (every field; under ``key``) for the current acceptance code."""
+    h = hashlib.sha256(key.encode())
+    for k, v in sorted(asdict(ep).items()):  # accept reads s, status_ok, extra_dL, ...: hash them all
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(v).tobytes() if isinstance(v, np.ndarray) else json.dumps(v).encode())
+    h.update(acceptance_hash().encode())
+    return Path(cache_dir) / f"{key}.acc-{h.hexdigest()[:32]}.npz"
 
-    A miss if the stored code hash differs or the result is not converged (A17: an INVALID is re-run, A16e).
+
+def _savez_atomic(f: Path, **arrays) -> None:
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f"{f.stem}.{os.getpid()}.{os.urandom(4).hex()}.tmp.npz")  # np.savez needs the .npz suffix
+    np.savez(tmp, **arrays)
+    os.replace(tmp, f)
+
+
+def _key(parent, t, names, leaf_sha: str, consts: dict, code: str) -> str:
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(parent, dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(t, dtype=np.float64).tobytes())
+    h.update(json.dumps([list(names), leaf_sha, consts, code], sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def retime_key(parent, t, names, leaf_sha: str) -> str:
+    """sha256 of what determines an endpoint.
+
+    The tree (t at full precision), the leaf data, the L-BFGS constants and box bounds, and ``code_hash``.
     """
+    consts = {k: getattr(retime, k) for k in _KEY_CONSTANTS} | {"LOG_T_MIN": LOG_T_MIN, "LOG_T_MAX": LOG_T_MAX}
+    return _key(parent, t, names, leaf_sha, consts, code_hash())
+
+
+def _load_entry(f: Path, code: str) -> Endpoint | None:
+    """The cached endpoint, or ``None`` (a miss) if the stored code hash differs."""
     with np.load(f) as z:
-        if "code_hash" not in z.files or z["code_hash"].item() != code:
+        if "code_hash" not in z.files or z["code_hash"].item() != code or "s" not in z.files:
             return None
-        rt = RetimeResult(**{k: z[k] if k == "t" else z[k].item() for k in z.files if k != "code_hash"})
-    return rt if rt.status == "converged" else None
+    return retime.load_endpoint(f)
+
+
+def _a16e_endpoint(cache_dir: Path, parent, t, names, leaf_sha: str) -> Endpoint | None:
+    """The endpoint of a pre-A16f entry for this tree, or ``None``.
+
+    Such an entry is a converged ``RetimeResult`` (so every scipy status was 0, 1 or 2) plus the A16e code hash,
+    under the key of the A16e constants and that hash; its restart history was not recorded.
+    """
+    codes = set()
+    for f in Path(cache_dir).glob("*.npz"):
+        with np.load(f) as z:
+            if "cg_iters" in z.files:
+                codes.add(z["code_hash"].item())
+    for code in sorted(codes):
+        f = Path(cache_dir) / f"{_key(parent, t, names, leaf_sha, _A16E_CONSTANTS, code)}.npz"
+        if not f.exists():
+            continue
+        with np.load(f) as z:
+            if z["status"].item() != "converged":
+                continue
+            s = np.log(z["t"][np.asarray(parent) >= 0])  # A16e stored t = exp(s); log(exp(±15)) == ±15 exactly
+            ctr = {k: z[k].item() for k in ("L_start", "nit", "restarts", "extra_dL")}
+        return Endpoint(
+            s=s, **ctr, status_ok=True, message=f"migrated A16e cache entry {f.stem}", history=np.zeros((0, 3))
+        )
+    return None
 
 
 def retime_cached(
     parent, t, names, leaf_sha, x, var, device, cache_dir
 ) -> tuple[RetimeResult, bool | None, str | None]:
-    """(result, cache hit, key).
+    """(result, endpoint cache hit, key).
 
-    Without ``cache_dir`` always re-times (hit and key ``None``). Only converged results are stored or served.
+    Without ``cache_dir`` always re-times (hit and key ``None``). Every endpoint is stored whatever its status
+    (a migrated A16e endpoint too, under the new key; an endpoint saved before a failed acceptance too, then the
+    error is re-raised). The acceptance is memoised under (endpoint key, endpoint, ``acceptance_hash``), so an
+    arm shared by several gates is accepted once per acceptance code.
     """
     if cache_dir is None:
-        return retime_subprocess(parent, t, x, var, device), None, None
+        return retime_subprocess(parent, t, x, var, device)[0], None, None
     key = retime_key(parent, t, names, leaf_sha)
     f = Path(cache_dir) / f"{key}.npz"
     code = code_hash()
-    if f.exists() and (hit := _load_entry(f, code)) is not None:
-        return hit, True, key
-    rt = retime_subprocess(parent, t, x, var, device)
-    if rt.status == "converged":
-        Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f"{key}.{os.getpid()}.{os.urandom(4).hex()}.tmp.npz")  # np.savez needs the .npz suffix
-        np.savez(tmp, **asdict(rt), code_hash=code)
-        os.replace(tmp, f)
-    return rt, False, key
+    ep = _load_entry(f, code) if f.exists() else None
+    hit = ep is not None
+    if not hit:
+        ep = _a16e_endpoint(cache_dir, parent, t, names, leaf_sha) if Path(cache_dir).is_dir() else None
+    if ep is not None and (acc := _acceptance_file(cache_dir, key, ep)).exists():
+        with np.load(acc) as z:
+            rt = retime._fields(z, RetimeResult)
+        if not hit:
+            _savez_atomic(f, **asdict(ep), code_hash=code)
+        return rt, True, key
+    try:
+        rt, ep_out = retime_subprocess(parent, t, x, var, device, endpoint=ep)
+    except subprocess.CalledProcessError as err:
+        if not hit and (ep or getattr(err, "endpoint", None)) is not None:
+            _savez_atomic(f, **asdict(ep or err.endpoint), code_hash=code)
+        raise
+    if not hit:
+        _savez_atomic(f, **asdict(ep_out), code_hash=code)
+    _savez_atomic(_acceptance_file(cache_dir, key, ep_out), **asdict(rt))
+    return rt, ep is not None, key
 
 
 def _unique(paths, what: str) -> Path:
@@ -254,6 +357,8 @@ def gate(jax_dir: Path, upstream: Path, device: str | None = None, cache_dir=Non
         "n_genes": len(genes),
         "invalid_arms": invalid,
         "arms": rep,
+        "acceptance": "A16f",
+        "acceptance_hash": acceptance_hash(),
     } | v
 
 
@@ -263,19 +368,75 @@ def gate_upstream_only(upstream: Path, device: str | None, cache_dir) -> dict:
     if leaf_sha256(arm["x"], arm["var"], arm["cells"]) != arm["leaf_sha256"]:
         raise ValueError("upstream's stored leaf arrays do not match its recorded leaf_sha256")
     rep, rt = _arm_report(arm, arm["cells"], arm["x"], arm["var"], None, 0, device, cache_dir)
-    return {"upstream": str(upstream), "status": rt.status, "arm": rep}
+    return {
+        "upstream": str(upstream),
+        "status": rt.status,
+        "arm": rep,
+        "acceptance": "A16f",
+        "acceptance_hash": acceptance_hash(),
+    }
 
 
-def main(argv: list[str] | None = None) -> Path:
-    """Gate one case; write the report to ``--out`` and return its path."""
+def parse_lines(spec: str) -> set[int]:
+    """Manifest ids from "0,3-5,9" (ranges inclusive)."""
+    out = set()
+    for part in spec.split(","):
+        lo, _, hi = part.strip().partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def recheck(manifest: Path, device: str | None = None, lines: set[int] | None = None) -> list[Path]:
+    """Re-evaluate every existing report of a wave manifest under A16f; returns the rewritten paths.
+
+    ``upstream`` lines rerun ``gate_upstream_only`` and ``jax`` lines rerun ``gate`` on the arms recorded in the old
+    report, with the line's cache: cached endpoints skip L-BFGS, the acceptance is recomputed. The previous report is
+    kept under ``superseded`` (the first superseded one on a repeat). Lines without a report, reports whose stored
+    ``acceptance_hash`` equals the current one, and ``timing`` lines are skipped; with ``lines`` only those manifest
+    ids are considered.
+    """
+    done, current = [], acceptance_hash()
+    for ln in read_manifest(manifest):
+        p = Path(ln["gate_out"])
+        if (
+            (lines is not None and int(ln["id"]) not in lines)
+            or ln["kind"] not in ("upstream", "jax")
+            or not p.exists()
+        ):
+            continue
+        old = json.loads(p.read_text())
+        if old.get("acceptance_hash") == current:
+            continue
+        cache = Path(ln["cache"]) if ln["cache"] else None
+        if ln["kind"] == "upstream":
+            new = gate_upstream_only(Path(old["upstream"]), device, cache)
+        else:
+            new = gate(Path(old["jax"]), Path(old["upstream"]), device, cache)
+        new["superseded"] = old["superseded"] if "superseded" in old else old
+        _write_json(p, new)
+        done.append(p)
+    return done
+
+
+def main(argv: list[str] | None = None) -> Path | list[Path]:
+    """Gate one case and write the report to ``--out`` (its path), or ``--recheck`` a manifest (the rewritten paths)."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--jax", type=Path)
-    ap.add_argument("--upstream", required=True, type=Path)
-    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--upstream", type=Path)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--recheck", action="store_true", help="re-evaluate a manifest's reports under A16f")
+    ap.add_argument("--manifest", type=Path, default=None)
+    ap.add_argument("--lines", default=None, help="with --recheck: manifest ids, e.g. 0,3-5")
     ap.add_argument("--device", default=None)
     ap.add_argument("--retime-cache", type=Path, default=None, help="opt-in re-time cache directory")
     ap.add_argument("--upstream-only", action="store_true", help="re-time only the upstream arm into the cache")
     args = ap.parse_args(argv)
+    if args.recheck:
+        if args.manifest is None or args.jax or args.upstream or args.out or args.upstream_only:
+            ap.error("--recheck needs --manifest and none of --jax/--upstream/--out/--upstream-only")
+        return recheck(args.manifest, args.device, None if args.lines is None else parse_lines(args.lines))
+    if args.upstream is None or args.out is None:
+        ap.error("--upstream and --out are required")
     if args.upstream_only:
         if args.retime_cache is None or args.jax is not None:
             ap.error("--upstream-only needs --retime-cache and no --jax")

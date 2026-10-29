@@ -36,6 +36,17 @@
 # line a finished gate is skipped. A line whose gate crashed after `bench.run` reruns the jax run (a new
 # timestamp dir) but re-uses every finished re-time. Each timing line is one job on one GPU, so its three
 # M runs are interleaved on the same device by construction.
+# A16f recheck mode (SWEEP_MODE=recheck): each array task re-evaluates the existing report of one manifest line from the
+# cached endpoints (`bench.gate --recheck --lines <id>`), so each 10k line runs as its own A100 job. A line without a
+# report is skipped here; `--recheck` itself skips a report whose stored acceptance_hash equals the current
+# acceptance code's (so a changed acceptance re-evaluates every line). It sets
+# BONSAI_HESS_MEM_FRAC=0.8 (JVP batch budget; XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 as always). Lines whose arms share an
+# endpoint reuse its memoised acceptance once one task has finished it. Submit (same worktree discipline):
+#
+#   exp=SWEEP_MANIFEST=$R/w1.tsv,SWEEP_SHA=$(git rev-parse HEAD),SWEEP_MODE=recheck
+#   up=$(sbatch --parsable --export=ALL,$exp --array=0-8 bench/slurm/gate.sbatch)
+#   sbatch --export=ALL,$exp --array=9-26 --dependency=afterok:$up bench/slurm/gate.sbatch
+#
 # Logs: <gate output dir>/task-<jobid>_<index>.log, next to the outputs, never in the repo. Before the manifest line is
 # known (guard failures, a bad manifest) SLURM's own output goes to ~/bonsai-m2-gate-guard-<jobid>_<index>.log
 # (stdout and stderr merged; override with `sbatch --output=...`).
@@ -82,15 +93,25 @@ exec >> "$(dirname "$gate_out")/task-${SLURM_ARRAY_JOB_ID:-0}_${i}.log" 2>&1
 echo "== line $i: $kind $setting ($gate_out) on $(hostname), started $(date -u +%FT%TZ), sha $(git rev-parse HEAD)"
 nvidia-smi -L || true
 
-if [[ -s "$gate_out" ]]; then
-  echo "skip: $gate_out exists"
-  exit 0
-fi
-
 n="${SLURM_CPUS_PER_TASK:-8}"
 export OMP_NUM_THREADS="$n" MKL_NUM_THREADS="$n" OPENBLAS_NUM_THREADS="$n"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 run=(uv run --locked --extra cuda12 python -m)
+
+if [[ "${SWEEP_MODE:-}" == recheck ]]; then
+  if [[ ! -s "$gate_out" ]]; then
+    echo "skip: no report $gate_out to recheck"
+  else  # skips inside if the report's acceptance_hash is current
+    BONSAI_HESS_MEM_FRAC=0.8 "${run[@]}" bench.gate --recheck --manifest "$manifest" --lines "$i" --device 0
+  fi
+  echo "== line $i done $(date -u +%FT%TZ)"
+  exit 0
+fi
+
+if [[ -s "$gate_out" ]]; then
+  echo "skip: $gate_out exists"
+  exit 0
+fi
 
 jax_args() {  # common bench.run arguments of this line
   args=(--config "$(field config)" --out "$(field run_out)")
