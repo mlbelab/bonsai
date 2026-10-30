@@ -222,7 +222,8 @@ def test_resolve_upstream_needs_exactly_one_dir(tmp_path, monkeypatch):
 def _arm(hit):
     return {
         "L_raw_stage": {"greedy": -9.0, "redo_starry": -8.0},
-        "retime": {"L": -100.0, "status": "converged", "gap": 1e-5, "sum_abs_pg": 1e-9, "restarts": 1},
+        "retime": {"L": -100.0, "status": "converged", "gap": 1e-5, "sum_abs_pg": 1e-9, "restarts": 1, "n_escapes": 2,
+                   "L_escape_gain": 1.25e-3},
         "retime_cache_hit": hit, "quartet_accuracy": 0.9, "quartet_accuracy_raw": 0.95, "rf_normalised": 0.1, "rf_normalised_raw": 0.05,
     }  # fmt: skip
 
@@ -301,6 +302,7 @@ def test_aggregate_reads_both_waves_and_the_timing_runs(tmp_path):
         "sequential_M256_m1 |" not in md.split("## INVALID")[0].split("sim10k_s0")[-1]
     )  # no gate for the timing run of M=256
     assert "- sim10k_s0 sequential_M256_m1" not in md  # the M=256 timing run has no gate of its own
+    assert "| restarts | cache hit | escapes | L escape gain |" in md and "| 1 | False | 2 | 1.250e-03 |" in md  # A16g
     assert dec["R1"] is None and dec["blocked"] == []  # a partial table decides nothing
 
 

@@ -425,7 +425,7 @@ def test_gate_reports_cache_hits_and_reuses_identical_arms(tmp_path, monkeypatch
     c = tmp_path / "cache"
     g1 = gate_mod.gate(a, b, cache_dir=c)
     assert [g1["arms"][k]["retime_cache_hit"] for k in ("jax", "upstream")] == [False, True]
-    assert g1["acceptance"] == "A16f" and calls == [None]
+    assert g1["acceptance"] == "A16g" and calls == [None]
     g2 = gate_mod.gate(a, b, cache_dir=c)
     assert [g2["arms"][k]["retime_cache_hit"] for k in ("jax", "upstream")] == [True, True] and calls == [None]
     assert gate_mod.gate(a, b)["arms"]["jax"]["retime_cache_hit"] is None
@@ -439,7 +439,7 @@ def test_upstream_only_fills_the_cache_for_the_later_gate(tmp_path, monkeypatch)
     main(["--upstream", str(b), "--upstream-only", "--retime-cache", str(c), "--out", str(out)])
     rep = json.loads(out.read_text())
     assert rep["status"] == "converged" and rep["arm"]["retime_cache_hit"] is False and calls == [None]
-    assert rep["acceptance"] == "A16f"
+    assert rep["acceptance"] == "A16g"
     assert gate_mod.gate(a, b, cache_dir=c)["arms"]["upstream"]["retime_cache_hit"] is True
     with pytest.raises(SystemExit):
         main(["--upstream", str(b), "--upstream-only", "--out", str(out)])  # needs a cache
@@ -572,15 +572,15 @@ def test_recheck_rewrites_reports_from_cached_endpoints(tmp_path, monkeypatch):
     assert main(["--recheck", "--manifest", str(tmp_path / "w.tsv")]) == [up_out]  # g_out's hash is current now
     assert len(calls) == n + 1  # everything memoised now
     up, g = json.loads(up_out.read_text()), json.loads(g_out.read_text())
-    assert (up["acceptance"], up["status"], up["superseded"]) == ("A16f", "converged", old_up)
-    assert (g["acceptance"], g["verdict"], g["superseded"]) == ("A16f", "PASS", old_g)
-    assert up["acceptance_hash"] == g["acceptance_hash"] == "A16f fixed"
+    assert (up["acceptance"], up["status"], up["superseded"]) == ("A16g", "converged", old_up)
+    assert (g["acceptance"], g["verdict"], g["superseded"]) == ("A16g", "PASS", old_g)
+    assert up["acceptance_hash"] == g["acceptance_hash"] == gate_mod.report_hash()
     assert main(["--recheck", "--manifest", str(tmp_path / "w.tsv")]) == []  # stored hashes current: skipped
     assert json.loads(g_out.read_text()) == g
     monkeypatch.setattr(gate_mod, "acceptance_hash", lambda: "A16f fixed again")  # acceptance changed again
     assert main(["--recheck", "--manifest", str(tmp_path / "w.tsv")]) == [up_out, g_out]
     g2 = json.loads(g_out.read_text())
-    assert g2["superseded"] == old_g and g2["acceptance_hash"] == "A16f fixed again"
+    assert g2["superseded"] == old_g and g2["acceptance_hash"] == gate_mod.report_hash()
     with pytest.raises(SystemExit):
         main(["--recheck"])  # needs --manifest
 
@@ -600,6 +600,17 @@ def test_real_subprocess_accepts_the_cached_endpoint(tmp_path, monkeypatch):
     assert (r2.L, r2.gap, r2.nit, r2.restarts, r2.status) == (r1.L, r1.gap, r1.nit, r1.restarts, r1.status)
     ep = gate_mod.retime.load_endpoint(tmp_path / f"{key}.npz")
     assert ep.history.shape == (r1.restarts + 1, 3) and ep.nit == r1.nit == int(ep.history[:, 0].sum())
+    # A16g escape step through the real subprocess. At this converged endpoint no search gains: the endpoint comes back
+    # unchanged (no progress, no L-BFGS). With two edges pushed to s = −10 the floor search gains: L-BFGS is resumed from
+    # its point, L rises and the history grows.
+    same = gate_mod.escape_subprocess(parent, t, x, var, None, ep, True, True)
+    np.testing.assert_array_equal(same.s, ep.s)
+    assert (same.nit, same.history.shape) == (ep.nit, ep.history.shape)
+    low = gate_mod.retime.replace(ep, s=np.where(np.arange(len(ep.s)) < 2, -10.0, ep.s))
+    esc = gate_mod.escape_subprocess(parent, t, x, var, None, low, False, True)
+    L = gate_mod.ref_tree.tree_loglik
+    assert esc.L_start == ep.L_start and esc.nit >= ep.nit and esc.history.shape[0] > ep.history.shape[0]
+    assert L(parent, times_of(parent, esc.s), x, var) > L(parent, times_of(parent, low.s), x, var)
 
 
 def test_parse_lines():
@@ -623,3 +634,211 @@ def test_acceptance_memo_is_keyed_on_every_endpoint_field(tmp_path, monkeypatch)
         gate_mod.retime_cached(*_TREE, _XX, _XX, None, tmp_path)
         assert len(calls) == n + 1 and np.array_equal(calls[-1].s, other.s)  # re-accepted, not memo-served
         assert calls[-1].extra_dL == other.extra_dL
+
+
+# --- A16g: escapes on top of the memoised A16f acceptance
+
+
+def _flat_stub(monkeypatch, calls, steps, until=8):
+    """retime_subprocess stub (records the endpoint): L = nit, and a flat term 1.0 (> bound) while nit < ``until``, else
+    converged; escape_subprocess stub (records the endpoint) adds 1 to s and to nit (the fresh endpoint has nit 7)."""
+
+    def fake(parent, t, x, var, device=None, endpoint=None):
+        calls.append(endpoint)
+        ep = _ep(parent, t) if endpoint is None else endpoint
+        r = _rr(times_of(parent, ep.s), float(ep.nit))
+        if ep.nit < until:  # accept's own gap clause: the gap is the sole failure
+            b = gate_mod.retime._bound(parent, x)
+            why = f"gap {1.0:.3e} > {b:.3e} (Newton {0.0:.3e}, flat {1.0:.3e}, floor {0.0:.3e})"
+            r = gate_mod.retime.replace(r, gap=1.0, gap_newton=0.0, gap_flat=1.0, status="invalid", reason=why)
+        return r, ep
+
+    def esc(parent, t, x, var, device, ep, flat, floor):
+        steps.append((ep, flat, floor))
+        return gate_mod.retime.replace(ep, s=ep.s + 1.0, nit=ep.nit + 1)
+
+    monkeypatch.setattr(gate_mod, "retime_subprocess", fake)
+    monkeypatch.setattr(gate_mod, "escape_subprocess", esc)
+
+
+def test_acceptance_hash_is_the_a16f_one_and_report_hash_adds_the_escape_code(monkeypatch):
+    """The memo key stays A16f's (existing memo entries keep hitting); the report hash changes with the escape code."""
+    h, rh, eh, r = gate_mod.acceptance_hash(), gate_mod.report_hash(), gate_mod.escape_hash(), gate_mod.retime
+    for name, v in [("settle", lambda *a: None), ("needs_escape", lambda *a: None), ("escape_step", lambda *a: None),
+                    ("escape_point", lambda *a: None), ("escape_flags", lambda *a: None),
+                    ("sole_gap_failure", lambda *a: None), ("MAX_ESCAPES", 4)]:  # fmt: skip
+        monkeypatch.setattr(r, name, v)
+        assert (gate_mod.acceptance_hash(), gate_mod.report_hash() != rh, gate_mod.escape_hash() != eh) == (
+            h,
+            True,
+            True,
+        )
+        monkeypatch.undo()
+    for name, v in [("CURV_REL", 1e-9), ("FLOOR_S", -8.0), ("LG_GRID", 7), ("line_gain", lambda *a: None),
+                    ("joint_gain", lambda *a: None), ("free_hessian", lambda *a: None)]:  # fmt: skip
+        monkeypatch.setattr(r, name, v)  # shared by the acceptance and the escape point: everything changes
+        assert gate_mod.acceptance_hash() != h and gate_mod.report_hash() != rh and gate_mod.escape_hash() != eh, name
+        monkeypatch.undo()
+
+
+def test_passing_arm_recheck_builds_no_hessian(tmp_path, monkeypatch):
+    """A16g recheck of a passing arm: the report hash changed (escape code), the memoised A16f acceptance is re-read,
+    no subprocess (no Hessian, no L-BFGS) runs and no escape entry is written."""
+    from bench.sweep import write_manifest
+
+    _, b, _ = _sim_arms(tmp_path)
+    calls = []
+    _stub(monkeypatch, calls)
+    c, up_out = tmp_path / "cache", tmp_path / "up.json"
+    main(["--upstream", str(b), "--upstream-only", "--retime-cache", str(c), "--out", str(up_out)])
+    write_manifest(
+        [{"id": 0, "kind": "upstream", "case": "x", "gate_out": str(up_out), "cache": str(c)}], tmp_path / "w"
+    )
+    monkeypatch.setattr(gate_mod, "escape_hash", lambda: "other escape code")
+    monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("subprocess (Hessian) ran"))
+    monkeypatch.setattr(gate_mod, "escape_subprocess", lambda *a, **k: pytest.fail("escape ran"))
+    assert main(["--recheck", "--manifest", str(tmp_path / "w")]) == [up_out]
+    rep = json.loads(up_out.read_text())
+    assert rep["acceptance_hash"] == gate_mod.report_hash() and rep["arm"]["retime"]["n_escapes"] == 0
+    assert rep["arm"]["retime"]["escapes"] == [] and rep["arm"]["retime_cache_hit"] is True
+    key = rep["arm"]["retime_cache_key"]
+    assert not (c / f"{gate_mod.escape_key(key)}.npz").exists()
+
+
+def test_escaped_endpoint_is_cached_under_the_escape_key(tmp_path, monkeypatch):
+    """An arm whose memoised A16f acceptance needs an escape: one escape, the escaped endpoint's acceptance memoised under
+    the escape key and the escape state stored there (the original endpoint stays under key). A repeat runs nothing;
+    after an acceptance change both acceptances are recomputed but the escape continues from the stored state; another
+    escape code is another escape key, so the escape runs again."""
+    calls, steps = [], []
+    _flat_stub(monkeypatch, calls, steps)
+    rt, hit, key, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    s0 = _ep(*_TREE[:2]).s
+    assert (rt.status, hit, esc["n_escapes"], len(calls), len(steps)) == ("converged", False, 1, 2, 1)
+    assert steps[0][1:] == (True, False) and esc["L_escape_gain"] == rt.L - 7.0 == 1.0
+    assert esc["escapes"] == [dict(zip(gate_mod.retime.ESCAPE_COLS, [rt.L, 0.0, 0.0, 0.0, 0.0, 1.0], strict=True))]
+    np.testing.assert_array_equal(gate_mod.retime.load_endpoint(tmp_path / f"{key}.npz").s, s0)
+    ef = tmp_path / f"{gate_mod.escape_key(key)}.npz"
+    with np.load(ef) as z:
+        e, n, rows, L0 = gate_mod.retime.read_escape(z)
+    np.testing.assert_array_equal(e.s, s0 + 1)
+    assert (n, rows.shape, L0) == (1, (0, 6), 7.0)  # saved before its acceptance
+    assert gate_mod._acceptance_file(tmp_path, ef.stem, e).exists()
+    assert gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)[3] == esc and (len(calls), len(steps)) == (2, 1)
+    monkeypatch.setattr(gate_mod, "acceptance_hash", lambda: "new acceptance code")
+    rt, _, _, esc2 = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert (len(calls), len(steps), esc2["n_escapes"], rt.status) == (4, 1, 1, "converged")
+    np.testing.assert_array_equal(calls[-1].s, s0 + 1)  # re-accepted the stored escaped endpoint
+    monkeypatch.setattr(gate_mod, "escape_hash", lambda: "other escape code")
+    gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert len(steps) == 2
+
+
+def test_escape_state_survives_a_crash_in_the_escaped_acceptance(tmp_path, monkeypatch):
+    """The escape state is stored before the escaped endpoint's acceptance: after a crash there the next call accepts the
+    stored escaped endpoint without escaping again."""
+    import subprocess
+
+    calls, steps = [], []
+    _flat_stub(monkeypatch, calls, steps)
+    real = gate_mod.retime_subprocess
+
+    def crash_on_escaped(parent, t, x, var, device=None, endpoint=None):
+        if endpoint is not None and endpoint.nit > 7:
+            raise subprocess.CalledProcessError(1, ["bench.retime"])
+        return real(parent, t, x, var, device, endpoint)
+
+    monkeypatch.setattr(gate_mod, "retime_subprocess", crash_on_escaped)
+    with pytest.raises(subprocess.CalledProcessError):
+        gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    monkeypatch.setattr(gate_mod, "retime_subprocess", real)
+    rt, _, _, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert (rt.status, esc["n_escapes"], len(steps), len(esc["escapes"])) == ("converged", 1, 1, 1)
+
+
+def test_escape_without_cache(monkeypatch):
+    """Without a cache the arm escapes too (both arms identically), storing nothing."""
+    calls, steps = [], []
+    _flat_stub(monkeypatch, calls, steps)
+    rt, hit, key, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, None)
+    assert (rt.status, hit, key, esc["n_escapes"], calls[0]) == ("converged", None, None, 1, None)
+
+
+def test_report_records_the_escapes(tmp_path, monkeypatch):
+    """The gate report carries n_escapes, the L gained and the acceptance after each escape (JSON)."""
+    a, b, _ = _sim_arms(tmp_path)
+    _flat_stub(monkeypatch, [], [], until=np.inf)  # always needs an escape: the cap
+    g = json.loads(main(["--jax", str(a), "--upstream", str(b), "--out", str(tmp_path / "g.json")]).read_text())
+    r = g["arms"]["upstream"]["retime"]
+    assert (r["n_escapes"], r["L_escape_gain"], len(r["escapes"])) == (5, 5.0, 5) and "5 escapes" in r["reason"]
+    assert set(r["escapes"][0]) == set(gate_mod.retime.ESCAPE_COLS) and g["verdict"] == "INVALID"
+
+
+def test_recheck_runs_the_escape_for_arms_that_now_need_it(tmp_path, monkeypatch):
+    """A report written without the escape (A16f-like) is revisited under A16g: the memoised acceptance of the original
+    endpoint is re-read (no subprocess for it), the escape runs and its endpoint is accepted, the report records it."""
+    from bench.sweep import write_manifest
+
+    _, b, _ = _sim_arms(tmp_path)
+    calls, steps = [], []
+    _flat_stub(monkeypatch, calls, steps, until=np.inf)
+    c, up_out = tmp_path / "cache", tmp_path / "up.json"
+    monkeypatch.setattr(gate_mod.retime, "needs_escape", lambda r, bound: False)  # the old code: no escape
+    main(["--upstream", str(b), "--upstream-only", "--retime-cache", str(c), "--out", str(up_out)])
+    assert json.loads(up_out.read_text())["status"] == "invalid" and (len(calls), len(steps)) == (1, 0)
+    write_manifest(
+        [{"id": 0, "kind": "upstream", "case": "x", "gate_out": str(up_out), "cache": str(c)}], tmp_path / "w"
+    )
+    monkeypatch.undo()
+    _flat_stub(monkeypatch, calls, steps)
+    assert main(["--recheck", "--manifest", str(tmp_path / "w")]) == [up_out]
+    rep = json.loads(up_out.read_text())
+    assert (rep["status"], rep["arm"]["retime"]["n_escapes"], rep["superseded"]["status"]) == (
+        "converged",
+        1,
+        "invalid",
+    )
+    assert len(steps) == 1 and len(calls) == 2 and calls[-1] is not None  # only the escaped endpoint was accepted
+
+
+@pytest.mark.slow
+def test_a16f_memo_entry_written_before_a16g_still_hits(tmp_path, monkeypatch):
+    """The perturb_ctrl_sub upstream endpoint and its A16f memo entry, written by the A16f recheck (db2a6d6 code, report
+    acceptance_hash 885b198a...), copied out of data/m2_gate: ``retime_cached`` serves the memo under A16g with no
+    subprocess (no Hessian rebuild), and the result is the recorded A16f one."""
+    import shutil
+
+    from bench.run import _leaf_arrays
+
+    from bonsai._ref.newick import parse_newick
+
+    root = Path(__file__).resolve().parents[2] / "data"
+    up_dir, cache, report = (root / "perturb_ctrl_sub/bonsai_workdir/results", root / "m2_gate/retime_cache",
+                             root / "m2_gate/upstream/perturb_ctrl_sub.json")  # fmt: skip
+    if not (up_dir.exists() and report.exists()):
+        pytest.skip("perturb_ctrl_sub arm or its A16f report not available")
+    old = json.loads(report.read_text())
+    key = old["arm"]["retime_cache_key"]
+    for f in [cache / f"{key}.npz", *cache.glob(f"{key}.acc-*.npz")]:
+        shutil.copy(f, tmp_path / f.name)
+    up = load_arm(up_dir)
+    p, t, nm = parse_newick(up["stage_newick"]["redo_starry"])
+    X, V = _leaf_arrays(p, nm, up["cells"], up["x"], up["var"])
+    monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("acceptance (Hessian) rebuilt"))
+    rt, hit, key2 = gate_mod.retime_cached(p, t, nm, up["leaf_sha256"], X, V, None, tmp_path)
+    assert (hit, key2) == (True, key) and old["acceptance_hash"] == gate_mod.acceptance_hash()
+    assert (rt.status, rt.gap, rt.L) == ("invalid", old["arm"]["retime"]["gap"], old["arm"]["retime"]["L"])
+
+
+def test_stored_escape_state_is_ignored_once_the_original_passes(tmp_path, monkeypatch):
+    """The escape state is continued only while the original endpoint's acceptance still needs an escape: if a new
+    acceptance code accepts the original, the result is that acceptance with no escape."""
+    calls, steps = [], []
+    _flat_stub(monkeypatch, calls, steps)
+    _, _, key, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert esc["n_escapes"] == 1 and (tmp_path / f"{gate_mod.escape_key(key)}.npz").exists()
+    monkeypatch.setattr(gate_mod, "acceptance_hash", lambda: "new acceptance code")
+    _flat_stub(monkeypatch, calls, steps, until=7)  # the original (nit 7) now passes
+    rt, _, _, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert (rt.status, rt.L, esc["n_escapes"], esc["escapes"], len(steps)) == ("converged", 7.0, 0, [], 1)
+    assert calls[-1].nit == 7  # only the original endpoint was re-accepted

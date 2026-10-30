@@ -11,11 +11,18 @@ sha256 of the tree, ``leaf_sha256``, the L-BFGS constants and box, and the code 
 constants and code hash) are read as endpoints and migrated to the new key. Writes are atomic (concurrent array tasks
 may duplicate work, never corrupt an entry).
 
+A16g (``retime_escaped``, on top of ``retime_cached``): the escape decision is read from the memoised A16f acceptance
+(memo key and ``acceptance_hash`` unchanged, so existing memo entries keep hitting); only an arm that needs an escape runs
+``escape_subprocess`` (escape point and resumed L-BFGS) and the A16f acceptance of the escaped endpoint, memoised under
+the escape key. The escape state is cached under ``escape_key`` (the endpoint key plus ``escape_hash``), so later runs
+continue from it. Arms that need no escape write nothing new. Reports carry ``report_hash`` (acceptance plus escape
+code) as their ``acceptance_hash``.
+
 ``python -m bench.gate --recheck --manifest W.tsv [--lines 0,3-5] [--device IDX]`` re-evaluates every existing
 gate/upstream report of the manifest (or of the given manifest ids; bench/slurm/gate.sbatch has a per-line recheck mode) whose stored
-``acceptance_hash`` differs from the current one, from the cached endpoints under A16f, and rewrites it with
-``acceptance: "A16f"`` and the current ``acceptance_hash``, keeping the previous
-report under ``superseded``.
+``acceptance_hash`` differs from the current ``report_hash``, from the cached endpoints and memoised acceptances, and
+rewrites it with ``acceptance: "A16g"`` and the current ``report_hash`` (arms that now need an escape run it; passing arms
+only re-read their memo), keeping the previous report under ``superseded``.
 
 Both arms' redo-starry trees are re-timed by the same float64 re-timer (``bench.retime``, in a
 ``JAX_ENABLE_X64=1`` subprocess) on the same leaf arrays, then compared by A1 (re-timed L per
@@ -71,15 +78,31 @@ def gate_verdict(L_jax, L_up, n_cells, n_genes, q_jax=None, q_up=None) -> dict:
     }
 
 
+def _env(device):
+    env = dict(os.environ, JAX_ENABLE_X64="1")
+    if device is not None:
+        env.update(CUDA_VISIBLE_DEVICES=str(device), XLA_PYTHON_CLIENT_PREALLOCATE="false")
+    return env
+
+
+def escape_subprocess(parent, t, x, var, device, ep: Endpoint, flat: bool, floor: bool) -> Endpoint:
+    """The escaped endpoint of one ``bench.retime.escape_step`` from ``ep`` in an x64 subprocess (A16g)."""
+    with tempfile.TemporaryDirectory(prefix="bonsai_escape_") as d:
+        inp, out = Path(d) / "in.npz", Path(d) / "out.npz"
+        ep_f = {f"ep_{k}": v for k, v in asdict(ep).items()}
+        np.savez(inp, parent=parent, t=t, x=x, var=var, esc_flat=flat, esc_floor=floor, **ep_f)
+        cmd = [sys.executable, "-m", "bench.retime", str(inp), str(out)]
+        subprocess.run(cmd, cwd=metadata.REPO, env=_env(device), check=True)
+        return retime.load_endpoint(out)
+
+
 def retime_subprocess(parent, t, x, var, device: str | None = None, endpoint: Endpoint | None = None):
     """(RetimeResult, Endpoint) of ``bench.retime`` in a ``JAX_ENABLE_X64=1`` subprocess (on GPU ``device`` if given).
 
     With ``endpoint`` the subprocess skips L-BFGS and only runs the A16f acceptance on it. If the subprocess fails
     after L-BFGS, the raised ``CalledProcessError`` carries the saved endpoint as ``.endpoint`` (else ``None``).
     """
-    env = dict(os.environ, JAX_ENABLE_X64="1")
-    if device is not None:
-        env.update(CUDA_VISIBLE_DEVICES=str(device), XLA_PYTHON_CLIENT_PREALLOCATE="false")
+    env = _env(device)
     ep = {} if endpoint is None else {f"ep_{k}": v for k, v in asdict(endpoint).items()}
     with tempfile.TemporaryDirectory(prefix="bonsai_retime_") as d:
         inp, out = Path(d) / "in.npz", Path(d) / "out.npz"
@@ -136,6 +159,38 @@ def acceptance_hash() -> str:
         h.update(inspect.getsource(getattr(retime, name)).encode())
     h.update(json.dumps({k: getattr(retime, k) for k in _ACCEPT_CONSTANTS}, sort_keys=True).encode())
     return h.hexdigest()
+
+
+_ESCAPE_CODE = (
+    "sole_gap_failure", "needs_escape", "escape_flags", "escape_point", "escape_step", "settle",
+    "line_gain", "joint_gain", "free_set", "free_hessian", "eigh", "_grad_scale",
+)  # fmt: skip  # A16g: the escape rule and everything escape_point's search depends on
+_ESCAPE_CONSTANTS = ("MAX_ESCAPES", "ESCAPE_COLS", "CURV_REL", "FLOOR_S", "LG_ALPHA_MIN", "LG_GRID", "OPTIONS")
+
+
+def escape_hash() -> str:
+    """sha256 of the escape code (A16g): retime's ``_ESCAPE_CODE`` sources and ``_ESCAPE_CONSTANTS``.
+
+    The tree pass and L-BFGS are already in the endpoint key (``code_hash``) the escape key is derived from.
+    """
+    h = hashlib.sha256()
+    for name in _ESCAPE_CODE:
+        h.update(inspect.getsource(getattr(retime, name)).encode())
+    h.update(json.dumps({k: getattr(retime, k) for k in _ESCAPE_CONSTANTS}, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def report_hash() -> str:
+    """What a report's result depends on besides the endpoints: ``acceptance_hash`` and ``escape_hash`` (A16g).
+
+    Stored as a report's ``acceptance_hash``; ``recheck`` revisits reports whose stored hash differs.
+    """
+    return hashlib.sha256(f"{acceptance_hash()}:{escape_hash()}".encode()).hexdigest()
+
+
+def escape_key(key: str) -> str:
+    """Cache key of the escape state of the endpoint under ``key`` (A16g)."""
+    return hashlib.sha256(f"{key}:{escape_hash()}".encode()).hexdigest()
 
 
 def _acceptance_file(cache_dir, key: str, ep: Endpoint) -> Path:
@@ -243,6 +298,53 @@ def retime_cached(
     return rt, ep is not None, key
 
 
+def retime_escaped(
+    parent, t, names, leaf_sha, x, var, device, cache_dir
+) -> tuple[RetimeResult, bool | None, str | None, dict]:
+    """(result, endpoint cache hit, key, escapes): ``retime_cached`` plus the A16g escape loop (``retime.settle``).
+
+    The escape decision is read from the (memoised) A16f acceptance; a passing arm costs nothing more. An escaping arm
+    runs ``escape_subprocess`` per escape and the A16f acceptance of each escaped endpoint (memoised under
+    ``escape_key(key)``); the escape state is stored there after every escape (before its acceptance) and continued from
+    on later runs. ``escapes``: n_escapes, L_escape_gain (final L minus L before the first escape) and the acceptance
+    after each escape. Without ``cache_dir`` nothing is stored.
+    """
+    if cache_dir is None:
+        rt, ep = retime_subprocess(parent, t, x, var, device)
+        hit = key = ef = None
+    else:
+        rt, hit, key = retime_cached(parent, t, names, leaf_sha, x, var, device, cache_dir)
+        ep = retime.load_endpoint(Path(cache_dir) / f"{key}.npz")
+        ef = Path(cache_dir) / f"{escape_key(key)}.npz"
+
+    def acc(e):  # the A16f acceptance of an escaped endpoint, memoised like retime_cached's
+        m = None if ef is None else _acceptance_file(cache_dir, ef.stem, e)
+        if m is not None and m.exists():
+            with np.load(m) as z:
+                return retime._fields(z, RetimeResult)
+        r = retime_subprocess(parent, t, x, var, device, endpoint=e)[0]
+        if m is not None:
+            _savez_atomic(m, **asdict(r))
+        return r
+
+    bound = retime._bound(parent, x)
+    st = None
+    if ef is not None and ef.exists() and retime.needs_escape(rt, bound):  # stale if the original now passes
+        with np.load(ef) as z:
+            st = retime.read_escape(z)
+    start = (st[0], None, *st[1:]) if st else (ep, rt)
+    r, (_, n, rows, L0) = retime.settle(
+        acc,
+        lambda e, r: escape_subprocess(parent, t, x, var, device, e, *retime.escape_flags(r)),
+        start[0],
+        bound,
+        *start[1:],
+        save=None if ef is None else lambda state: _savez_atomic(ef, **retime.escape_fields(state)),
+    )
+    escapes = [dict(zip(retime.ESCAPE_COLS, row, strict=True)) for row in rows.tolist()]
+    return r, hit, key, {"n_escapes": n, "L_escape_gain": r.L - L0, "escapes": escapes}
+
+
 def _unique(paths, what: str) -> Path:
     paths = list(paths)
     if len(paths) != 1:
@@ -309,10 +411,10 @@ def _arm_report(arm: dict, cells, x, var, truth, seed: int, device, cache_dir=No
     L_raw = {k: tree_loglik(p, t, *_leaf_arrays(p, nm, cells, x, var)) for k, (p, t, nm) in stages.items()}
     p, t, nm = stages["redo_starry"]
     X, V = _leaf_arrays(p, nm, cells, x, var)
-    rt, hit, key = retime_cached(p, t, nm, arm["leaf_sha256"], X, V, device, cache_dir)
+    rt, hit, key, esc = retime_escaped(p, t, nm, arm["leaf_sha256"], X, V, device, cache_dir)
     out = {
         "L_raw_stage": L_raw,
-        "retime": {k: v for k, v in rt.__dict__.items() if k != "t"},
+        "retime": {k: v for k, v in rt.__dict__.items() if k != "t"} | esc,
         "retime_cache_hit": hit,
         "retime_cache_key": key,
     }
@@ -357,8 +459,8 @@ def gate(jax_dir: Path, upstream: Path, device: str | None = None, cache_dir=Non
         "n_genes": len(genes),
         "invalid_arms": invalid,
         "arms": rep,
-        "acceptance": "A16f",
-        "acceptance_hash": acceptance_hash(),
+        "acceptance": "A16g",
+        "acceptance_hash": report_hash(),
     } | v
 
 
@@ -372,8 +474,8 @@ def gate_upstream_only(upstream: Path, device: str | None, cache_dir) -> dict:
         "upstream": str(upstream),
         "status": rt.status,
         "arm": rep,
-        "acceptance": "A16f",
-        "acceptance_hash": acceptance_hash(),
+        "acceptance": "A16g",
+        "acceptance_hash": report_hash(),
     }
 
 
@@ -387,15 +489,16 @@ def parse_lines(spec: str) -> set[int]:
 
 
 def recheck(manifest: Path, device: str | None = None, lines: set[int] | None = None) -> list[Path]:
-    """Re-evaluate every existing report of a wave manifest under A16f; returns the rewritten paths.
+    """Re-evaluate every existing report of a wave manifest under A16g; returns the rewritten paths.
 
     ``upstream`` lines rerun ``gate_upstream_only`` and ``jax`` lines rerun ``gate`` on the arms recorded in the old
-    report, with the line's cache: cached endpoints skip L-BFGS, the acceptance is recomputed. The previous report is
+    report, with the line's cache: cached endpoints skip L-BFGS, memoised acceptances are re-read (escaping where A16g
+    needs it). The previous report is
     kept under ``superseded`` (the first superseded one on a repeat). Lines without a report, reports whose stored
-    ``acceptance_hash`` equals the current one, and ``timing`` lines are skipped; with ``lines`` only those manifest
+    ``acceptance_hash`` equals the current ``report_hash``, and ``timing`` lines are skipped; with ``lines`` only those manifest
     ids are considered.
     """
-    done, current = [], acceptance_hash()
+    done, current = [], report_hash()
     for ln in read_manifest(manifest):
         p = Path(ln["gate_out"])
         if (
@@ -424,7 +527,7 @@ def main(argv: list[str] | None = None) -> Path | list[Path]:
     ap.add_argument("--jax", type=Path)
     ap.add_argument("--upstream", type=Path)
     ap.add_argument("--out", type=Path)
-    ap.add_argument("--recheck", action="store_true", help="re-evaluate a manifest's reports under A16f")
+    ap.add_argument("--recheck", action="store_true", help="re-evaluate a manifest's reports under A16g")
     ap.add_argument("--manifest", type=Path, default=None)
     ap.add_argument("--lines", default=None, help="with --recheck: manifest ids, e.g. 0,3-5")
     ap.add_argument("--device", default=None)

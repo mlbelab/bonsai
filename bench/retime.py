@@ -1,4 +1,4 @@
-"""Float64 gate re-timer (amendments A16, A16b, A16c, A16f): ``python -m bench.retime IN.npz OUT.npz``.
+"""Float64 gate re-timer (amendments A16, A16b, A16c, A16f, A16g): ``python -m bench.retime IN.npz OUT.npz``.
 
 Two parts, cached separately by ``bench.gate`` (A16f):
 
@@ -16,6 +16,12 @@ Two parts, cached separately by ``bench.gate`` (A16f):
   L ≈ L∞ − a·eˢ: the Newton term gives ½·a·eˢ of the true gain ≈ a·eˢ; A16f detail). Terms may
   double-count, which only errs towards INVALID. It is an estimate, not a rigorous bound.
 
+- ``settle`` (A16g, the saddle escape, on top of the unchanged A16f acceptance): while ``needs_escape`` (the gap
+  is the only failure and the flat/negative-direction plus floor terms together exceed the bound; the Newton term
+  never counts), ``escape_step`` moves to the best point the A16f searches of those terms measure (``escape_point``),
+  resumes ``lbfgs`` from there (same options and restart rule), and the escaped endpoint is accepted again; at most
+  MAX_ESCAPES escapes, then INVALID (also if an escape makes no progress or lowers L).
+
 Accepted iff every scipy run stopped with status 0, 1 or 2, the last restart gained ≤ the bound,
 gap ≤ the bound, and the engine's L agrees with ``_ref.tree`` to 1e-10 relative. The bound is
 1e-2·(1e-6·N·G): each arm's error is ≤ 1% of the A1 slack. Anything else is INVALID with the reason.
@@ -23,13 +29,14 @@ gap ≤ the bound, and the engine's L agrees with ``_ref.tree`` to 1e-10 relativ
 The input file holds ``parent``, ``t``, ``x``, ``var`` and optionally an endpoint (``Endpoint`` fields
 prefixed ``ep_``), which skips ``lbfgs``; the output holds the ``RetimeResult`` and the endpoint. A freshly
 computed endpoint is also written to ``OUT.ep.npz`` before the acceptance runs (A16f detail), so a crash in the
-acceptance does not lose the L-BFGS work.
+acceptance does not lose the L-BFGS work. With ``esc_flat``/``esc_floor`` in the input, ``main`` instead runs one
+``escape_step`` from the given endpoint and writes the escaped endpoint (unprefixed) to OUT.
 """
 
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import equinox as eqx
 import jax
@@ -53,6 +60,8 @@ FLOOR_S = -9.0  # free edges with s below this get the joint floor-gain term
 HESS_MEM_FRAC = float(os.environ.get("BONSAI_HESS_MEM_FRAC", "0.25"))
 HESS_CPU_BYTES = 2 * 2**30  # ... or this budget when the device reports none (CPU)
 HESS_MAX_BATCH = 512
+MAX_ESCAPES = 5  # A16g
+ESCAPE_COLS = ("L", "gap", "gap_newton", "gap_flat", "gap_floor", "converged")  # one row per escape: its acceptance
 
 
 @dataclass(frozen=True)
@@ -376,9 +385,152 @@ def accept(parent, x, var, ep: Endpoint) -> RetimeResult:
     )
 
 
+def sole_gap_failure(r: RetimeResult, bound: float) -> bool:
+    """The gap is ``r``'s only failure: its reason is exactly the gap clause ``accept`` writes from r's own terms.
+
+    ``accept`` joins every failing test (bad scipy stop, exhausted restarts, engine/reference L mismatch, gap), so an
+    exact match rules all the others out. A stored flag would change ``RetimeResult`` and so ``acceptance_hash``,
+    invalidating every memoised A16f acceptance; this reconstruction keeps them valid.
+    """
+    flat = f"flat {r.gap_flat:.3e}, floor {r.gap_floor:.3e}"
+    return r.reason == f"gap {r.gap:.3e} > {bound:.3e} (Newton {r.gap_newton:.3e}, {flat})"
+
+
+def needs_escape(r: RetimeResult, bound: float) -> bool:
+    """A16g (controller ruling): the gap is the sole failure and flat + floor > ``bound`` (combined).
+
+    The Newton term never counts: its gain is the positive-curvature remainder the L-BFGS restart loop handles.
+    """
+    return sole_gap_failure(r, bound) and r.gap_flat + r.gap_floor > bound
+
+
+def escape_flags(r: RetimeResult) -> tuple[bool, bool]:
+    """(flat, floor): the searches ``escape_point`` runs, those whose A16f term in ``r`` gained anything."""
+    return bool(r.gap_flat > 0), bool(r.gap_floor > 0)
+
+
+def escape_point(parent, x, var, ep: Endpoint, flat: bool, floor: bool) -> np.ndarray:
+    """A16g: the highest-L point measured by the selected A16f searches (``ep.s`` if none gains).
+
+    ``flat``: ``line_gain`` along each eigenvector of the free-set H with λ ≤ τ and, with ≥ 2, ``joint_gain`` on their
+    span (the dense H is rebuilt: the memoised acceptance keeps no eigenvectors); ``floor``: ``joint_gain`` over the free
+    edges with s < FLOOR_S. The searches are A16f's own; the best of their fp64 ``_ref`` evaluations is kept.
+    """
+    parent = np.asarray(parent, dtype=np.int64)
+    x, var = np.asarray(x, dtype=np.float64), np.asarray(var, dtype=np.float64)
+    s = np.asarray(ep.s, dtype=np.float64)
+    t = times_of(parent, s)
+    e, _, grad_s = _objective(parent, t, x, var)
+    R = ref_tree.tree_loglik_grad(parent, t, x, var)
+    fi = np.flatnonzero(free_set(s, (R.grad * t)[e]))
+    best = [R.L, s]
+
+    def keep(v, z):
+        if v > best[0]:
+            best[:] = [v, np.array(z)]
+        return v
+
+    def L(z):
+        return keep(ref_tree.tree_loglik(parent, times_of(parent, z), x, var), z)
+
+    def Lg(z):
+        tz = times_of(parent, z)
+        r = ref_tree.tree_loglik_grad(parent, tz, x, var)
+        return keep(r.L, z), (r.grad * tz)[e]
+
+    if flat and len(fi):
+        H = free_hessian(grad_s, s, fi)
+        w, U = eigh(0.5 * (H + H.T))
+        fl = np.flatnonzero(w <= CURV_REL * _grad_scale(parent, t, R))
+        Uf = np.zeros((len(s), len(fl)))
+        Uf[fi] = U[:, fl]
+        for k in range(len(fl)):
+            line_gain(L, s, Uf[:, k])
+        if len(fl) >= 2:
+            joint_gain(Lg, s, Uf)
+    cols = fi[s[fi] < FLOOR_S]
+    if floor and len(cols):
+        joint_gain(Lg, s, np.eye(len(s))[:, cols], [(LOG_T_MIN - v, LOG_T_MAX - v) for v in s[cols]])
+    return best[1]
+
+
+def escape_step(parent, x, var, ep: Endpoint, flat: bool, floor: bool) -> Endpoint:
+    """A16g: ``lbfgs`` (its options and restart loop) resumed from ``escape_point``; start log clip(exp z) = z to rounding.
+
+    The escaped endpoint keeps ``ep``'s L_start and sums nit and history over all runs; its other fields are the last
+    run's. If no search gained (the point is ``ep.s``) ``ep`` itself is returned: ``settle`` reports no progress.
+    """
+    z = escape_point(parent, x, var, ep, flat, floor)
+    if np.array_equal(z, ep.s):
+        return ep
+    new = lbfgs(parent, times_of(parent, z), x, var)
+    return replace(new, L_start=ep.L_start, nit=ep.nit + new.nit, history=np.vstack([ep.history, new.history]))
+
+
+def settle(acc, step, ep: Endpoint, bound: float, r=None, n: int = 0, rows=(), L0=None, save=None):
+    """A16g escape loop: (final acceptance, escape state (ep, n, rows, L0)).
+
+    ``acc(ep)`` is the A16f acceptance (``r`` is ``acc(ep)`` if already known), ``step(ep, r)`` one escape. While
+    ``needs_escape`` and fewer than MAX_ESCAPES escapes were taken: escape, ``save(state)`` (before the acceptance), accept
+    again. ``rows`` (ESCAPE_COLS) records the acceptance after each escape, L0 the L before the first; ``n``, ``rows``, ``L0``
+    continue a stored state (``n > len(rows)``: the last escape's acceptance is still missing). INVALID with the reason
+    if an escape made no progress (the point is the endpoint), lowered L by more than 1e-10·|L| (rounding of a sum of
+    that size is far below; also checked on resume, against the last recorded L), or still needs an escape at the cap.
+    """
+
+    def lowered(prev, L):
+        return f"escape lowered L by {prev - L:.3e}" if prev is not None and L < prev - 1e-10 * abs(prev) else ""
+
+    rows = [tuple(row) for row in rows]
+    L_prev = (rows[-1][0] if rows else L0) if r is None and n > 0 else None  # resuming a stored escape state
+    r = acc(ep) if r is None else r
+    L0 = r.L if L0 is None else L0
+    stop = lowered(L_prev, r.L)
+    while True:
+        if len(rows) < n:
+            rows.append(tuple(float(getattr(r, c)) for c in ESCAPE_COLS[:-1]) + (float(r.status == "converged"),))
+        if stop or n >= MAX_ESCAPES or not needs_escape(r, bound):
+            break
+        new = step(ep, r)
+        if np.array_equal(new.s, ep.s):
+            stop = "escape made no progress"
+            break
+        L_prev, ep, n = r.L, new, n + 1
+        if save is not None:
+            save((ep, n, np.array(rows, dtype=np.float64).reshape(-1, len(ESCAPE_COLS)), L0))
+        r = acc(ep)
+        stop = lowered(L_prev, r.L)
+    if stop or needs_escape(r, bound):
+        why = stop or f"{n} escapes, the flat/floor gain still exceeds the bound"
+        r = replace(r, status="invalid", reason="; ".join(filter(None, [r.reason, why])))
+    return r, (ep, n, np.array(rows, dtype=np.float64).reshape(-1, len(ESCAPE_COLS)), L0)
+
+
 def retime(parent, t, x, var) -> RetimeResult:
-    """Re-time a fixed topology in float64 (A16) and accept it (A16f). ``x``/``var`` node-indexed (leaf rows read)."""
-    return accept(parent, x, var, lbfgs(parent, t, x, var))
+    """Re-time a fixed topology in float64 (A16), accept it (A16f) with the saddle escape (A16g).
+
+    ``x``/``var`` node-indexed (leaf rows read).
+    """
+    bound = _bound(parent, x)
+    return settle(
+        lambda e: accept(parent, x, var, e),
+        lambda e, r: escape_step(parent, x, var, e, *escape_flags(r)),
+        lbfgs(parent, t, x, var),
+        bound,
+    )[0]
+
+
+def escape_fields(state, prefix="esc_") -> dict:
+    """The npz fields of an escape state (ep, n, rows, L0): the endpoint's fields and n, rows, L0, all ``prefix``ed."""
+    ep, n, rows, L0 = state
+    return {prefix + k: v for k, v in asdict(ep).items()} | {prefix + "n": n, prefix + "rows": rows, prefix + "L0": L0}
+
+
+def read_escape(z, prefix="esc_"):
+    """The escape state in an open npz written with ``escape_fields``, or ``None`` if it holds none."""
+    if prefix + "n" not in z.files:
+        return None
+    return _fields(z, Endpoint, prefix), int(z[prefix + "n"]), z[prefix + "rows"], float(z[prefix + "L0"])
 
 
 def _fields(z, cls, prefix=""):
@@ -404,11 +556,18 @@ def load_endpoint(path) -> Endpoint:
 
 
 def main(argv: list[str]) -> None:
-    """``IN.npz OUT.npz``: the endpoint (given, or from ``lbfgs`` and saved to OUT.ep.npz first), then ``accept``."""
+    """``IN.npz OUT.npz``: the endpoint (given, or from ``lbfgs`` and saved to OUT.ep.npz first), then ``accept``.
+
+    With ``esc_flat``/``esc_floor`` (A16g): one ``escape_step`` from the given endpoint instead, written to OUT.
+    """
     inp, out = argv
     with np.load(inp) as z:
         a = (z["parent"], z["t"], z["x"], z["var"])
         ep = _fields(z, Endpoint, "ep_") if "ep_s" in z.files else None
+        flags = (bool(z["esc_flat"]), bool(z["esc_floor"])) if "esc_flat" in z.files else None
+    if flags is not None:  # A16g: one escape step, the escaped endpoint is the output
+        np.savez(out, **asdict(escape_step(a[0], a[2], a[3], ep, *flags)))
+        return
     if ep is None:
         ep = lbfgs(*a)
         np.savez(endpoint_path(out), **asdict(ep))

@@ -1,10 +1,11 @@
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 from bench import retime as rt
-from bench.retime import free_set, gap_terms, line_gain, retime
+from bench.retime import free_set, gap_terms, line_gain, retime, settle
 from scipy.optimize import minimize_scalar
 
 from bonsai._ref.tree import tree_loglik_grad
@@ -215,6 +216,241 @@ def test_line_gain_respects_the_box():
     s0 = np.array([14.0, 0.0])
     assert line_gain(lambda z: float(z[0]), s0, np.array([1.0, 0.0])) == pytest.approx(1.0, rel=1e-12, abs=0)
     assert line_gain(lambda z: float(-(z[0] ** 2)), np.zeros(2), np.array([1.0, 0.0])) == 0.0  # at a maximum
+
+
+# --- A16g: the saddle escape
+
+
+def _rr(s, L, gap_flat=0.0, gap_floor=0.0, gap_newton=0.0, bound=1e-6, extra=""):
+    """A RetimeResult at ``s`` (other diagnostics neutral) as ``accept`` writes it: gap = the sum; above ``bound`` the reason
+    is accept's gap clause (preceded by ``extra``, another failing test's clause), converged otherwise."""
+    gap = gap_newton + gap_flat + gap_floor
+    clause = f"gap {gap:.3e} > {bound:.3e} (Newton {gap_newton:.3e}, flat {gap_flat:.3e}, floor {gap_floor:.3e})"
+    reason = "; ".join(filter(None, [extra, clause if gap > bound else ""]))
+    f = dict.fromkeys(rt.RetimeResult.__dataclass_fields__, 0.0) | {"t": np.exp(s), "L": L, "gap": gap}
+    f |= {"gap_flat": gap_flat, "gap_floor": gap_floor, "gap_newton": gap_newton, "reason": reason}
+    return rt.RetimeResult(**f | {"status": "invalid" if reason else "converged"})
+
+
+def _ep0(s, **kw):
+    return replace(rt.Endpoint(np.asarray(s, float), -9.0, 3, 0, 0.0, True, "toy", np.zeros((1, 3))), **kw)
+
+
+def test_needs_escape_rule():
+    """Controller ruling: escape iff the gap is the only failure and flat + floor > bound (combined); never on the Newton
+    term (mutant "escape counted on the Newton term" fails the first assert, "one term alone" the second)."""
+    b = 1.0
+    assert not rt.needs_escape(_rr([0.0], 0.0, gap_newton=5.0, gap_flat=0.4, gap_floor=0.4, bound=b), b)
+    assert rt.needs_escape(_rr([0.0], 0.0, gap_flat=0.6, gap_floor=0.6, bound=b), b)
+    assert rt.needs_escape(_rr([0.0], 0.0, gap_flat=1.1, bound=b), b)
+    assert rt.needs_escape(_rr([0.0], 0.0, gap_floor=1.1, bound=b), b)
+    assert not rt.needs_escape(_rr([0.0], 0.0, gap_flat=0.9, bound=b), b)  # converged: nothing to escape
+    for other in (
+        "scipy status 3 (NaN)",
+        "10 restarts, the last raised L by 2.000e+00",
+        "engine/reference L mismatch 1e-3",
+    ):
+        assert not rt.needs_escape(_rr([0.0], 0.0, gap_flat=1.1, bound=b, extra=other), b), other
+    assert rt.escape_flags(_rr([0.0], 0.0, gap_flat=0.6, gap_floor=0.0)) == (True, False)
+    assert rt.escape_flags(_rr([0.0], 0.0, gap_flat=0.0, gap_floor=1e-9)) == (False, True)
+
+
+def _saddle(q=0.01, c=1e-3, d=1e-5):
+    """L(y) = −½(y_0 − q·y_1²)² + c·y_1² − d·y_1⁴ (box ±15): a saddle at y = 0 with ∇L = 0 and H = diag(1, −2c).
+
+    Along e_1 alone (y_0 = 0) the best gain is c²/(4(d + q²/2)) ≈ 4.17e-3 at y_1² = c/(2d + q²); with y_0 = q·y_1²
+    re-optimised the maximum is c²/(4d) = 0.025 at y_1² = c/(2d) = 50, so only the resumed L-BFGS reaches it.
+    """
+
+    def Lg(y):
+        r = y[0] - q * y[1] ** 2
+        L = -0.5 * r**2 + c * y[1] ** 2 - d * y[1] ** 4
+        return float(L), np.array([-r, 2 * q * y[1] * r + 2 * c * y[1] - 4 * d * y[1] ** 3])
+
+    def H(y):  # −∇²L
+        r = y[0] - q * y[1] ** 2
+        h01 = 2 * q * y[1]
+        return -np.array([[-1.0, h01], [h01, 2 * q * r - 4 * q**2 * y[1] ** 2 + 2 * c - 12 * d * y[1] ** 2]])
+
+    return Lg, H, c**2 / (4 * d)
+
+
+_TOY_PARENT = np.array([-1, 0, 0])  # two edges: s = y
+
+
+def _toy(monkeypatch, Lg, H, tau=1e-10):
+    """acc for ``settle`` on a toy L (the A16f gap terms with the exact H) and the toy L patched into ``escape_step``:
+    ``escape_point`` reads the best point off the same A16f searches on the toy L, ``lbfgs`` is scipy L-BFGS-B with the
+    re-timer's options in the box, started at log clip(t) like the real one."""
+    from scipy.optimize import minimize
+
+    def acc(ep):
+        w, U = np.linalg.eigh(H(ep.s))
+        L, pg = Lg(ep.s)
+        g = gap_terms(w, U, pg, tau, ep.s, np.arange(len(ep.s)), lambda z: Lg(z)[0], Lg)
+        return _rr(ep.s, L, max(g["flat_sum"], g["flat_joint"]), g["floor"], g["newton"])  # bound 1e-6
+
+    def escape_point(parent, x, var, ep, flat, floor):
+        seen = [(Lg(ep.s)[0], ep.s)]
+
+        def L(z):
+            seen.append((Lg(z)[0], np.array(z)))
+            return seen[-1][0]
+
+        w, U = np.linalg.eigh(H(ep.s))
+        for k in np.flatnonzero(w <= tau):
+            line_gain(L, ep.s, U[:, k])
+        return max(seen, key=lambda c: c[0])[1]
+
+    def lbfgs(parent, t, x, var):
+        s0 = np.log(np.clip(t[parent >= 0], np.exp(rt.LOG_T_MIN), np.exp(rt.LOG_T_MAX)))
+        r = minimize(lambda y: tuple(-v for v in Lg(y)), s0, jac=True, method="L-BFGS-B",
+                     bounds=[(rt.LOG_T_MIN, rt.LOG_T_MAX)] * len(s0), options=rt.OPTIONS)  # fmt: skip
+        hist = np.array([[r.nit, -r.fun, r.status]], float)
+        return rt.Endpoint(np.asarray(r.x, float), Lg(s0)[0], int(r.nit), 0, 0.0, r.status in (0, 1, 2), "toy", hist)
+
+    monkeypatch.setattr(rt, "escape_point", escape_point)
+    monkeypatch.setattr(rt, "lbfgs", lbfgs)
+    return acc, lambda e, r: rt.escape_step(_TOY_PARENT, None, None, e, *rt.escape_flags(r))
+
+
+def test_settle_leaves_a_synthetic_saddle(monkeypatch):
+    """L-BFGS started at the saddle stops there at once (∇L = 0); A16f measures the negative direction's gain 4.17e-3 >
+    bound 1e-6 (INVALID). ``settle`` with the real ``escape_step`` moves along it, the resumed L-BFGS reaches the maximum
+    0.025 and the acceptance passes. Mutants: "no escape" stays INVALID at L = 0; "escape but no resumed L-BFGS" stops at
+    the line-search point, where ∂L/∂y_0 = q·y_1² ≈ 0.083 gives a Newton gap ≈ 3.5e-3 > bound. Tolerance: L-BFGS stops
+    at gtol 1e-12 or at rounding; L ≈ 0.025 to a few eps, rel 1e-9."""
+    Lg, H, top = _saddle()
+    acc, step = _toy(monkeypatch, Lg, H)
+    ep0 = rt.lbfgs(_TOY_PARENT, np.ones(3), None, None)
+    assert ep0.nit == 0 and np.array_equal(ep0.s, np.zeros(2))  # L-BFGS stops at the saddle
+    r0 = acc(ep0)
+    assert r0.status == "invalid" and r0.gap_flat == pytest.approx(4.1667e-3, rel=1e-4, abs=0)
+    saved = []
+    r, (ep, n, rows, L0) = settle(acc, step, ep0, 1e-6, save=saved.append)
+    assert r.status == "converged", r.reason
+    assert (n, L0) == (1, 0.0) and r.L == pytest.approx(top, rel=1e-9, abs=0) and r.L > r0.L
+    assert ep.nit == ep0.nit + ep.history[-1, 0] and ep.L_start == ep0.L_start and ep.history.shape == (2, 3)
+    np.testing.assert_array_equal(rows, [[r.L, r.gap, r.gap_newton, r.gap_flat, r.gap_floor, 1.0]])
+    assert len(saved) == 1 and saved[0][1] == 1 and saved[0][2].shape == (0, 6)  # saved before its acceptance
+    np.testing.assert_array_equal(saved[0][0].s, ep.s)
+
+
+def test_settle_cap_of_five_escapes():
+    """An acceptance that always asks for an escape: exactly MAX_ESCAPES = 5 escapes, then INVALID with the reason; each
+    escape's acceptance is recorded. A stored state continues: from n = 4 with the last row still missing, the row is
+    added and one more escape is allowed. A known first acceptance ``r`` is not recomputed."""
+    calls, accs = [], []
+
+    def acc(ep):
+        accs.append(ep)
+        return _rr(ep.s, float(ep.s[0]), gap_flat=1.0)
+
+    def step(ep, r):
+        calls.append(ep)
+        return replace(ep, s=ep.s + 1.0)
+
+    r, (ep, n, rows, L0) = settle(acc, step, _ep0([0.0, 0.0]), 1e-6)
+    assert (n, len(calls), len(accs), r.status) == (5, 5, 6, "invalid") and "5 escapes" in r.reason
+    assert rows.shape == (5, 6) and rows[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0] and (r.L, L0) == (5.0, 0.0)
+    calls.clear(), accs.clear()
+    r, (_, n, rows, _) = settle(acc, step, _ep0([4.0, 4.0]), 1e-6, None, 4, rows[:3], 0.0)
+    assert (n, len(calls), rows.shape) == (5, 1, (5, 6)) and rows[3, 0] == 4.0 and r.L == 5.0
+    accs.clear()
+    r, (_, n, _, _) = settle(acc, step, _ep0([0.0]), 1e-6, _rr([0.0], 0.0))  # r given and passing: nothing runs
+    assert (n, accs, r.status) == (0, [], "converged")
+
+
+def test_settle_stops_when_an_escape_makes_no_progress_or_lowers_L(monkeypatch):
+    """An escape whose point is the endpoint (no search gained) stops at once: INVALID "escape made no progress", no
+    escape counted (``escape_step`` returns the endpoint without running L-BFGS). An escaped endpoint with L lower by
+    more than 1e-10·|L| stops too: INVALID with the drop."""
+    ep0 = _ep0([0.0, 0.0])
+    r, (_, n, rows, _) = settle(lambda e: _rr(e.s, 0.0, gap_flat=1.0), lambda e, r: e, ep0, 1e-6)
+    assert (r.status, n, rows.shape) == ("invalid", 0, (0, 6)) and r.reason.endswith("escape made no progress")
+    monkeypatch.setattr(rt, "escape_point", lambda parent, x, var, ep, flat, floor: ep.s.copy())
+    monkeypatch.setattr(rt, "lbfgs", lambda *a: pytest.fail("L-BFGS ran without progress"))
+    assert rt.escape_step(_TOY_PARENT, None, None, ep0, True, False) is ep0
+    r, (_, n, rows, _) = settle(
+        lambda e: _rr(e.s, -float(e.s[0]), gap_flat=1.0), lambda e, r: replace(e, s=e.s + 1), ep0, 1e-6
+    )
+    assert (r.status, n, rows.shape) == ("invalid", 1, (1, 6)) and r.reason.endswith("escape lowered L by 1.000e+00")
+    r, _ = settle(lambda e: _rr(e.s, -1e6 - 1e-5 * e.s[0], gap_flat=1.0), lambda e, r: replace(e, s=e.s + 1), ep0, 1e-6)
+    assert "lowered" not in r.reason and "5 escapes" in r.reason  # a drop of 1e-5 ≤ 1e-10·|L| = 1e-4 is rounding
+    # resuming a stored state whose escaped endpoint (pending, n = 1 > len(rows) = 0) is below L0 = 0: INVALID too, not
+    # converged with a negative L_escape_gain (fix round 2)
+    r, (_, n, rows, L0) = settle(
+        lambda e: _rr(e.s, -1.0), lambda e, r: pytest.fail("escaped"), ep0, 1e-6, None, 1, (), 0.0
+    )
+    assert (r.status, n, rows.shape, L0) == ("invalid", 1, (1, 6), 0.0) and r.reason == "escape lowered L by 1.000e+00"
+    rows1 = [(0.5, 0.0, 0.0, 0.0, 0.0, 1.0)]  # with rows the reference is the last recorded L (0.5), not L0
+    assert (
+        settle(lambda e: _rr(e.s, 0.2), None, ep0, 1e-6, None, 2, rows1, 0.0)[0].reason
+        == "escape lowered L by 3.000e-01"
+    )
+    assert settle(lambda e: _rr(e.s, 0.7), None, ep0, 1e-6, None, 2, rows1, 0.0)[0].status == "converged"
+
+
+def test_main_runs_one_escape_step(tmp_path, monkeypatch):
+    """``esc_flat``/``esc_floor`` in the input: ``main`` runs ``escape_step`` with those flags and writes the endpoint."""
+    ep = _ep0([0.5, -1.0])
+    np.savez(tmp_path / "in.npz", parent=_TOY_PARENT, t=np.ones(3), x=np.zeros(1), var=np.ones(1), esc_flat=True,
+             esc_floor=False, **{f"ep_{k}": v for k, v in rt.asdict(ep).items()})  # fmt: skip
+    seen = []
+    monkeypatch.setattr(rt, "escape_step", lambda p, x, v, e, fl, fo: seen.append((fl, fo)) or replace(e, nit=99))
+    rt.main([str(tmp_path / "in.npz"), str(tmp_path / "out.npz")])
+    out = rt.load_endpoint(tmp_path / "out.npz")
+    np.testing.assert_array_equal(out.s, ep.s)
+    assert out.nit == 99 and seen == [(True, False)]
+
+
+@pytest.mark.x64
+def test_escape_point_reads_the_a16f_search_points(monkeypatch):
+    """bm_tree(30, 50): the point ``escape_point`` returns gains exactly the A16f flat term over the endpoint (same
+    deterministic searches on CPU; this endpoint has one flat eigenvalue, so the term is that line search). Without any
+    flag it returns the endpoint and builds no Hessian."""
+    parent, t0, x, var = _case(30, 50)
+    ep = rt.lbfgs(parent, t0, x, var)
+    r = rt.accept(parent, x, var, ep)
+    assert r.n_flat == 1 and r.status == "converged"
+    z = rt.escape_point(parent, x, var, ep, True, False)
+    L = rt.ref_tree.tree_loglik  # the evaluation the A16f searches use
+    gain = L(parent, rt.times_of(parent, z), x, var) - L(parent, rt.times_of(parent, ep.s), x, var)
+    assert gain == r.gap_flat and gain > 0
+    monkeypatch.setattr(rt, "free_hessian", lambda *a: pytest.fail("Hessian built"))
+    np.testing.assert_array_equal(rt.escape_point(parent, x, var, ep, False, False), ep.s)
+
+
+@pytest.mark.x64
+def test_escape_point_floor_branch():
+    """bm_tree(30, 50) endpoint with four leaf edges pushed to s = −10 (< FLOOR_S): the A16f floor term is the joint gain
+    of moving them back, and the point ``escape_point(floor=True)`` returns gains exactly that term (same deterministic
+    search on CPU). Reviewer mutant "skip the floor search" returns the endpoint (gain 0)."""
+    parent, t0, x, var = _case(30, 50)
+    ep = rt.lbfgs(parent, t0, x, var)
+    leaves = np.flatnonzero(~np.isin(np.arange(len(parent)), parent))[:4]
+    s = ep.s.copy()
+    s[np.searchsorted(np.flatnonzero(parent >= 0), leaves)] = -10.0
+    ep = replace(ep, s=s)
+    r = rt.accept(parent, x, var, ep)
+    assert r.n_floor >= 4 and r.gap_floor > _bound(30, 50) and rt.needs_escape(r, rt._bound(parent, x))
+    assert rt.escape_flags(r)[1]
+    z = rt.escape_point(parent, x, var, ep, False, True)
+    L = rt.ref_tree.tree_loglik_grad  # the evaluation the floor search uses
+    gain = L(parent, rt.times_of(parent, z), x, var).L - L(parent, rt.times_of(parent, ep.s), x, var).L
+    assert gain == r.gap_floor > 0
+
+
+@pytest.mark.x64
+def test_settle_without_excess_does_no_escape(monkeypatch):
+    """bm_tree(30, 50) passes A16f, so ``retime`` returns the plain acceptance and never escapes."""
+    parent, t0, x, var = _case(30, 50)
+    ep = rt.lbfgs(parent, t0, x, var)
+    plain = rt.accept(parent, x, var, ep)
+    monkeypatch.setattr(rt, "lbfgs", lambda *a: ep)
+    monkeypatch.setattr(rt, "escape_step", lambda *a: pytest.fail("escaped"))
+    r = retime(parent, t0, x, var)
+    assert (r.L, r.gap, r.status) == (plain.L, plain.gap, "converged")
 
 
 def _dense_fd_hessian(parent, t, x, var, free):
@@ -539,3 +775,42 @@ def test_a16f_gap_on_eec_sequential_endpoint():
     assert r.gap_newton == pytest.approx(7.659e-5, rel=1e-3, abs=0)
     assert r.gap_floor == pytest.approx(9.75e-5, rel=1e-3, abs=0)
     assert r.gap == r.gap_newton + r.gap_flat + r.gap_floor <= rt._bound(p, X)
+
+
+@pytest.mark.x64
+@pytest.mark.slow
+def test_a16g_escapes_the_saddle_of_perturb_ctrl_sub_upstream():
+    """The A16f re-check: the perturb_ctrl_sub upstream redo-starry endpoint (cached in data/m2_gate, copied to the
+    a16g fixtures) sits at a saddle: two eigenvalues ≤ τ (λ_min ≈ −1.09e-6), joint gain ≈ 1.894e-3 > bound 1.680e-3,
+    Newton part 2e-7. The escape moves to the best measured point and resumes L-BFGS; the acceptance then passes within
+    the cap. L-BFGS-B never lowers L, so L rises by at least the measured joint gain, up to rounding: L ≈ −1.8e5, engine
+    and `_ref` sums agree to ~eps·|L|·log(N·G) ≈ 1e-10, and 1e-6 (0.06% of the bound) is far above it. Reference
+    values from the A16f report (data/m2_gate/upstream/perturb_ctrl_sub.json): rel 1e-3 as in the a16f tests."""
+    from bench.gate import load_arm
+    from bench.run import _leaf_arrays
+
+    from bonsai._ref.newick import parse_newick
+
+    up_dir = _BONSAI / "data/perturb_ctrl_sub/bonsai_workdir/results"
+    ep_file = _FIXTURES.parent / "a16g" / "perturb_ctrl_sub_upstream_endpoint.npz"
+    if not (up_dir.exists() and ep_file.exists()):
+        pytest.skip("perturb_ctrl_sub upstream arm or its stored endpoint not available")
+    up = load_arm(up_dir)
+    p, t, nm = parse_newick(up["stage_newick"]["redo_starry"])
+    X, V = _leaf_arrays(p, nm, up["cells"], up["x"], up["var"])
+    ep = rt.load_endpoint(ep_file)
+    bound = rt._bound(p, X)
+    r0 = rt.accept(p, X, V, ep)
+    assert r0.status == "invalid" and r0.n_flat == 2 and r0.lambda_min == pytest.approx(-1.0911e-6, rel=1e-3, abs=0)
+    assert r0.gap_flat == pytest.approx(1.8942e-3, rel=1e-3, abs=0)
+    assert r0.gap_flat > bound > r0.gap_newton + r0.gap_floor and rt.needs_escape(r0, bound)
+    r, (ep_fin, n, rows, L0) = settle(
+        lambda e: rt.accept(p, X, V, e),
+        lambda e, r: rt.escape_step(p, X, V, e, *rt.escape_flags(r)),
+        ep, bound, r0,
+    )  # fmt: skip
+    print(f"A16g perturb_ctrl_sub upstream: L {r0.L!r} -> {r.L!r} (+{r.L - L0:.4e}), {n} escapes, gap {r.gap:.3e}")
+    assert r.status == "converged", r.reason
+    assert 1 <= n <= rt.MAX_ESCAPES and rows.shape == (n, 6) and rows[-1, -1] == 1.0
+    assert L0 == r0.L and r.L - r0.L >= r0.gap_flat_joint - 1e-6
+    assert r.gap <= bound and r.extra_dL <= bound and ep_fin.L_start == ep.L_start
