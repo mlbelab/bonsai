@@ -63,12 +63,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class GreedyConfig:
-    mode: str = "sequential"  # pair mode (A2); A17 R1 decides the default
+    mode: str = "joint"  # pair mode (A2); default joint by A17 R1 (docs/deviations.md); _ref/upstream stay sequential
     k: int = K_NN
     knn: bool = True  # kNN candidates while C > NN_MIN_CHILDREN (A19)
     lazy: bool = True  # bounds while C > LAZY_MIN_CHILDREN (A20)
-    rescore_top: int = 256  # M: rows per rescore batch (A17 R2)
-    merges_per_round: int = 1  # m, root pass only (A17 R3, A20)
+    rescore_top: int = 256  # M: rows per rescore batch; 256 kept by A17 R2
+    merges_per_round: int = 1  # m, root pass only (A20); 1 is the M2 default (A17 R3, report only)
     new_batch: int = 64  # rows per batch of new pairs, scored right after a merge or rebuild when bounds are on
     star_tol: float = STAR_TOL
     false_stop_check: bool = False  # diagnostic (A24): at each stop, host-re-score every near-threshold candidate

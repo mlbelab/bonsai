@@ -23,7 +23,7 @@ from .test_ref_greedy import _bm_on, _from_tree
 
 G = 60
 N = 24
-EXACT = GreedyConfig(knn=False, lazy=False, star_tol=1e-10)
+EXACT = GreedyConfig(mode="sequential", knn=False, lazy=False, star_tol=1e-10)
 # Times: engine and reference solve the same pair/star problems to their fp64 KKT resolution (≲ 1e-12 here); 1e-8 is
 # far above that and far below any branch length that decides a topology (plan Task 7).
 T_TOL = 1e-8
@@ -83,7 +83,7 @@ def _scorable(s: str, x, var, names) -> float:
 
 @pytest.fixture(scope="module")
 def built11():
-    """bm_tree(24, 60) seed 11, fp32, default config (bounds on; kNN off at C ≤ 50); also the NodeTable after redo."""
+    """bm_tree(24, 60) seed 11, fp32, default config, sequential (bounds on; kNN off at C ≤ 50); also the NodeTable after redo."""
     x, var = _leaves(N, 11)
     real, seen = build.redo_starry, []
 
@@ -93,7 +93,7 @@ def built11():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(build, "redo_starry", spy)
-        b = greedy_tree(x, var, _names(N))
+        b = greedy_tree(x, var, _names(N), GreedyConfig(mode="sequential"))
     return x, var, b, seen[0]
 
 
@@ -205,7 +205,7 @@ def test_noisy_data_stops_early_and_builds_valid_tree():
     device d ≤ 0, so the A24 host re-score is not needed; mixed noisy/informative cells are Task 6b's A24 test.)"""
     x, _ = _leaves(N, 11)
     var = np.full_like(x, 1e6)
-    b = greedy_tree(x, var, _names(N))
+    b = greedy_tree(x, var, _names(N), GreedyConfig(mode="sequential"))
     _, ref_events, _ = rg.greedy_tree(x, var)
     assert ref_events == [] and b.stats["events"] == []  # the fp64 reference merges nothing either
     assert len(b.parent) == N + 1 and np.all(b.parent[:N] == N)
@@ -296,7 +296,7 @@ def _assert_messages_consistent(table: NodeTable, root: int) -> None:
 def test_messages_consistent_after_redo_fixture():
     tree, root = _zero_edge_fixture()
     table = _table(tree, jnp.float32)
-    stats = redo_starry(table, root, GreedyConfig())
+    stats = redo_starry(table, root, GreedyConfig(mode="sequential"))
     assert stats["events"]  # non-vacuity: redo starry restructured the tree
     _assert_messages_consistent(table, root)
 
@@ -346,7 +346,7 @@ def test_redo_pass_order_and_outside_messages(monkeypatch):
         return s
 
     monkeypatch.setattr(build, "greedy_star", spy)
-    redo_starry(table, root, GreedyConfig())
+    redo_starry(table, root, GreedyConfig(mode="sequential"))
     assert [p for p, _ in calls[: len(expected)]] == expected
 
     def anc(v):
@@ -433,7 +433,9 @@ def test_special_child_greedy_merges_at_most_once(monkeypatch):
     ref_trace: list = []
     _, ref_events = rg.greedy_star(tree, 10, None, trace=ref_trace)
     eng_trace: list = []
-    stats = eg.greedy_star(table, 10, None, True, GreedyConfig(knn=False, lazy=False), trace=eng_trace)
+    stats = eg.greedy_star(
+        table, 10, None, True, GreedyConfig(mode="sequential", knn=False, lazy=False), trace=eng_trace
+    )
     assert [_key(e) for e in stats.events] == [_key(e) for e in ref_events]
     for events, trace in ((ref_events, ref_trace), (stats.events, eng_trace)):
         assert [_key(e) for e in events[:2]] == [("merge", 1, 8, 11, 0), ("merge", 1, 3, 12, 1)] and events[0].t[1] == 0

@@ -414,14 +414,14 @@ def test_false_stop_diagnostic_is_read_only_and_flags_false_stops(monkeypatch):
     """var = 1e6: no pair passes in fp64, the stop checks run and find no false stop. With every host re-score faked
     to 1.0 the stop is flagged; the trees are identical in all cases (the diagnostic never writes the store)."""
     x, var, names = _noisy_leaves()
-    base = greedy_tree(x, var, names, GreedyConfig())
+    base = greedy_tree(x, var, names, GreedyConfig(mode="sequential"))
     assert base.stats["n_stop_events"] == base.stats["n_band_rows"] == base.stats["n_false_stop_events"] == 0
-    on = greedy_tree(x, var, names, GreedyConfig(false_stop_check=True))
+    on = greedy_tree(x, var, names, GreedyConfig(mode="sequential", false_stop_check=True))
     assert on.stats["n_stop_events"] > 0 and on.stats["n_band_rows"] > 0 and on.stats["n_false_stop_events"] == 0
     assert on.stats["stop_check_s"] > 0 and on.stage_newick == base.stage_newick
     real = ref_pair.pair_score
     monkeypatch.setattr(ref_pair, "pair_score", lambda *a, **k: real(*a, **k)._replace(dlogl=1.0))
-    fake = greedy_tree(x, var, names, GreedyConfig(false_stop_check=True))
+    fake = greedy_tree(x, var, names, GreedyConfig(mode="sequential", false_stop_check=True))
     assert fake.stats["n_false_stop_events"] == fake.stats["n_stop_events"] > 0
     assert fake.stage_newick == base.stage_newick
 
@@ -443,7 +443,7 @@ def test_false_stop_band_rows_are_exactly_the_fresh_rows_within_the_resolution(m
         return greedy_star(table, n, None, True, cfg, trace=trace)
 
     tr: list = []
-    run_star(GreedyConfig(), tr)
+    run_star(GreedyConfig(mode="sequential"), tr)
     d = np.array([v[0] for v in tr[-1][0].values()])  # fresh rows of the final stop round, none host-scored
     assert len(d) == n * (n - 1) // 2 and not any(v[2] for v in tr[-1][0].values())
     gap = 1e-6 - d
@@ -451,7 +451,7 @@ def test_false_stop_band_rows_are_exactly_the_fresh_rows_within_the_resolution(m
     expected = int(np.sum((gap <= R) & (d <= 1e-6)))
     assert 0 < expected < len(d)
     monkeypatch.setattr(eg, "pair_round_resolution", lambda *a, **k: R)
-    st = run_star(GreedyConfig(false_stop_check=True))
+    st = run_star(GreedyConfig(mode="sequential", false_stop_check=True))
     assert st.n_stop_events == 1 and st.n_band_rows == expected
 
 

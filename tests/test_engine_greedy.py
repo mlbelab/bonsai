@@ -19,8 +19,8 @@ from ._trees import bm_tree
 
 G = 60
 N = 24
-EXACT = GreedyConfig(knn=False, lazy=False, star_tol=1e-10)
-FP32 = GreedyConfig(knn=False, lazy=False, star_tol=1e-4)  # upstream's star tolerance
+EXACT = GreedyConfig(mode="sequential", knn=False, lazy=False, star_tol=1e-10)
+FP32 = GreedyConfig(mode="sequential", knn=False, lazy=False, star_tol=1e-4)  # upstream's star tolerance
 # First near-tie round k* per fixture (flat trace, special-child rounds included): measured by the supervisor
 # 2026-10-28 after A18b (Task 9 Step 2a), regression pin.
 # Remeasure with (prints "fixture: first near-tie k*, first divergence d, rounds n"):
@@ -297,7 +297,9 @@ def test_rounds_are_exhaustive_with_small_batches():
     table = NodeTable(x, var)
     table.t[:12] = star_em(x, var)[0]
     trace: list = []
-    stats = greedy_star(table, 12, None, True, GreedyConfig(knn=False, lazy=False, rescore_top=8), trace=trace)
+    stats = greedy_star(
+        table, 12, None, True, GreedyConfig(mode="sequential", knn=False, lazy=False, rescore_top=8), trace=trace
+    )
     sizes = [(len(e[0]), len(e[1])) for e in trace]
     assert len(stats.events) >= 5 and all(m == c * (c - 1) // 2 for m, c in sizes)
     assert stats.n_rescore_batches == sum(-(-m // 8) for m, _ in sizes)
@@ -430,7 +432,7 @@ def test_node_table_grows_when_ids_exceed_capacity():
     run is identical to one with ample capacity: same ids, events, parents, times and device mirror."""
     x, var, _ = _fixture("seed12")
     x, var = x[:12], var[:12]
-    cfg = GreedyConfig(knn=False, lazy=False)
+    cfg = GreedyConfig(mode="sequential", knn=False, lazy=False)
     tables, events = [], []
     for cap in (None, 14):
         table = NodeTable(x, var, cap=cap)
@@ -456,7 +458,7 @@ def test_node_table_growth_with_knn_candidate_keys():
     _, _, x, var = bm_tree(52, G, np.random.default_rng(21))
     x, var = x[:52].copy(), var[:52].copy()
     x = x - x.mean(axis=0)
-    cfg = GreedyConfig()
+    cfg = GreedyConfig(mode="sequential")
     out = []
     for cap in (None, 54):
         table = NodeTable(x, var, cap=cap)
@@ -466,3 +468,9 @@ def test_node_table_growth_with_knn_candidate_keys():
     assert len(small.parent) > 54 and small.n > 54  # grew
     assert ev_small == ev_full and len(ev_full) > 0
     np.testing.assert_array_equal(small.parent[: small.n], full.parent[: full.n])
+
+
+def test_greedy_config_defaults():
+    """A17: R1 joint, R2 rescore_top 256, R3 merges_per_round 1."""
+    cfg = GreedyConfig()
+    assert (cfg.mode, cfg.rescore_top, cfg.merges_per_round) == ("joint", 256, 1)

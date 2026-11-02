@@ -19,7 +19,7 @@ from ._trees import bm_tree
 from .test_engine_greedy import _fixture, _ref_tree
 
 G = 60
-LAZY = GreedyConfig(knn=False)  # bounds on (C > 10), all pairs, m = 1
+LAZY = GreedyConfig(mode="sequential", knn=False)  # bounds on (C > 10), all pairs, m = 1
 
 
 def _leaves(n: int, seed: int):
@@ -79,9 +79,9 @@ def lazy24():
 
 @pytest.fixture(scope="module")
 def knn120():
-    """bm_tree(120, 60) seed 31 at the root, default config (kNN while C > 50, bounds, m = 1), instrumented."""
+    """bm_tree(120, 60) seed 31 at the root, default config, sequential (kNN while C > 50, bounds, m = 1), instrumented."""
     with pytest.MonkeyPatch.context() as mp:
-        return _run(*_leaves(120, 31), GreedyConfig(), mp)
+        return _run(*_leaves(120, 31), GreedyConfig(mode="sequential"), mp)
 
 
 def test_select_candidate_rescore_order_is_exact():
@@ -193,7 +193,7 @@ def test_lazy_matches_exhaustive_reference_x64():
     guarantee: the A3 bound is heuristic, so lazy selection can differ from the exhaustive one elsewhere (it replaces
     the plan's forced-stale test, ruling 2026-10-22)."""
     x, var = _leaves(40, 31)
-    cfg = GreedyConfig(knn=False, star_tol=1e-10)
+    cfg = GreedyConfig(mode="sequential", knn=False, star_tol=1e-10)
     stats, trace, _, _ = _run(x, var, cfg, dtype=jnp.float64)
     t0 = star_em(x, var, tol=cfg.star_tol)[0]
     _, ref_events = rg.greedy_star(_ref_tree(x, var, t0), 40, None, cfg.mode, cfg.star_tol)
@@ -263,7 +263,7 @@ def test_rebuild_before_stopping(monkeypatch):
     rng = np.random.default_rng(5)
     x = np.vstack([np.repeat(rng.normal(0, 2, (2, G)), 2, axis=0), rng.normal(0, 1, (56, G))])
     var = np.vstack([np.full((4, G), 0.1), np.full((56, G), 1e6)])
-    stats, trace, table, log = _run(x - x.mean(axis=0), var, GreedyConfig(), monkeypatch)
+    stats, trace, table, log = _run(x - x.mean(axis=0), var, GreedyConfig(mode="sequential"), monkeypatch)
     assert [(e.kind, e.i, e.j) for e in stats.events] == [("merge", 0, 1)]
     assert log["knn"] == [60, 59] and stats.n_rebuilds == 2 and len(table.children(60)) == 59
     assert len(trace) == 3 and all(max(v[0] for v in e[0].values()) <= eg.ACCEPT_DLOGL for e in trace[1:])
@@ -310,7 +310,7 @@ def test_near_threshold_merge_decided_on_host(monkeypatch, host_d):
 
     monkeypatch.setattr(eg, "pair_score", device)
     monkeypatch.setattr(eg.ref_pair, "pair_score", host)
-    stats, trace, _, _ = _run(x, var, GreedyConfig(knn=False, lazy=False))
+    stats, trace, _, _ = _run(x, var, GreedyConfig(mode="sequential", knn=False, lazy=False))
     assert stats.n_threshold_rescored >= 1 and stats.n_flagged_used_unrescored == 0
     d, _, is_host, *_ = trace[0][0][target]
     assert d == host_d and is_host  # the stored score is the host's
@@ -326,7 +326,7 @@ def test_merges_per_round_disjoint(lazy24, m):
     pairs with dLogL > 1e-6, in (d desc, ij asc) order, with their stored times; the first merge equals the m = 1
     run's; the root still stops at 3 children. At a non-root node m is ignored (redo starry merges one per round)."""
     x, var = _leaves(24, 11)
-    stats, trace, table, _ = _run(x, var, GreedyConfig(knn=False, merges_per_round=m))
+    stats, trace, table, _ = _run(x, var, GreedyConfig(mode="sequential", knn=False, merges_per_round=m))
     assert _key(stats.events[0]) == _key(lazy24[0].events[0])
     assert len(table.children(24)) == 3
     ev = iter([e for e in stats.events if e.depth == 0])  # the root's own merges (A18b)
@@ -349,8 +349,8 @@ def test_merges_per_round_disjoint(lazy24, m):
         multi += len(group) > 1
     assert multi > 0
     nx, nvar, outside = _fixture("nonroot")
-    one = _run(nx, nvar, GreedyConfig(knn=False), outside=outside)[0]
-    four = _run(nx, nvar, GreedyConfig(knn=False, merges_per_round=m), outside=outside)[0]
+    one = _run(nx, nvar, GreedyConfig(mode="sequential", knn=False), outside=outside)[0]
+    four = _run(nx, nvar, GreedyConfig(mode="sequential", knn=False, merges_per_round=m), outside=outside)[0]
     assert [_key(e) for e in four.events] == [_key(e) for e in one.events]
 
 
@@ -376,7 +376,7 @@ def test_near_threshold_extra_pair_decided_on_host(monkeypatch):
 
     monkeypatch.setattr(eg, "pair_score", device)
     monkeypatch.setattr(eg.ref_pair, "pair_score", host)
-    stats, trace, _, _ = _run(x, var, GreedyConfig(knn=False, lazy=False, merges_per_round=4))
+    stats, trace, _, _ = _run(x, var, GreedyConfig(mode="sequential", knn=False, lazy=False, merges_per_round=4))
     assert [_key(e)[1:3] for e in stats.events] == [(3, 7)]
     assert stats.n_threshold_rescored >= 2 and stats.n_flagged_used_unrescored == 0  # round 0 extra, round 1 best
 
@@ -387,7 +387,7 @@ def test_compiles_bounded_across_buckets(monkeypatch):
     nothing and gives identical events and counters (determinism)."""
     x, var = _leaves(70, 41)
     jax.clear_caches()
-    stats, trace, _, log = _run(x, var, GreedyConfig(), monkeypatch)
+    stats, trace, _, log = _run(x, var, GreedyConfig(mode="sequential"), monkeypatch)
     knn_buckets = {_bucket(C) for C in log["knn"]}
     star_buckets = {_bucket(len(e[1])) for e in trace if not e[0]}
     assert len(knn_buckets) >= 2 and len(star_buckets) >= 2  # buckets crossed
@@ -402,6 +402,6 @@ def test_compiles_bounded_across_buckets(monkeypatch):
     for name, (fn, n_shapes) in caches.items():
         assert 0 < fn._cached._cache_size() <= 2 * n_shapes, name
     with count_compilations() as c:
-        again = _run(x, var, GreedyConfig())[0]
+        again = _run(x, var, GreedyConfig(mode="sequential"))[0]
     assert c.count == 0
     assert [_key(e) for e in again.events] == [_key(e) for e in stats.events] and again[1:] == stats[1:]

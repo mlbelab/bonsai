@@ -278,3 +278,9 @@ re-optimisation at the root every max(⌊0.05·C⌋, 10) merges (TH:1154, 2354),
   starting from log t (TH:5009), which is −inf for a child whose time was clamped to 0. The reference starts such
   children at log 1e-4 (upstream's own floor elsewhere, TH:4823) instead; the device star EM hands every
   non-converged star to that reference.
+- Engine defaults (A17, M2 gate sweep; measurements in the workspace files `data/m2_gate/w1.md` (wave 1, R1) and `data/m2_gate/measurements.md` (waves 1 and 2, R2/R3), not committed).
+  R1: `GreedyConfig.mode` defaults to `"joint"` (mean re-timed L/(N·G) −1.15177 against −1.15469 sequential; all 18
+  wave-1 gates PASS). R2: `rescore_top` M = 256 is kept (median warm greedy time over the 10k seeds: 256 1967 s,
+  64 2298 s, 1024 2479 s). R3: `merges_per_round` m = 1 stays the M2 default (R3 is report only); reported: m = 4 fails A7 on
+  sim10k_s1, m = 16 fails A1 on golden and A7 on sim1k_s0 and sim10k_s0. `_ref` and `_ref.pair.pair_score` keep upstream's sequential default; tests compared with `_ref` pin
+  `mode="sequential"`. The frozen `bench/configs/jax_*.toml` are unchanged (the sweep sets the mode per line).
