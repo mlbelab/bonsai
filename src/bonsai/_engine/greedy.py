@@ -82,8 +82,8 @@ class GreedyStats(NamedTuple):
     n_rescored: int  # rows re-scored in the rescore batches (the rest of n_pair_scores: new pairs)
     n_rebuilds: int  # kNN index builds, the initial one included
     n_reopts: int
-    n_flagged_used_unrescored: int  # guard: flagged device rows stored without a host re-score; must stay 0
     n_threshold_rescored: int  # chosen pairs re-scored on the host because d − 1e-6 ≤ their resolution (A24)
+    n_star_fallbacks: int = 0  # star EMs whose device solve did not converge, re-solved by the fp64 reference
     # False-stop diagnostic (cfg.false_stop_check; never changes decisions):
     n_stop_events: int = 0  # stops examined
     n_false_stop_events: int = 0  # of those, stops with at least one band row whose fp64 d > 1e-6
@@ -99,8 +99,8 @@ _STAT_FIELDS = {
     "rescored": "n_rescored",
     "rebuilds": "n_rebuilds",
     "reopts": "n_reopts",
-    "unrescored": "n_flagged_used_unrescored",
     "thr": "n_threshold_rescored",
+    "star_fb": "n_star_fallbacks",
     "stop": "n_stop_events",
     "false": "n_false_stop_events",
     "band": "n_band_rows",
@@ -333,8 +333,8 @@ def greedy_star(
         "rescored": 0,
         "rebuilds": 0,
         "reopts": 0,
-        "unrescored": 0,
         "thr": 0,
+        "star_fb": 0,
         "stop": 0,
         "false": 0,
         "band": 0,
@@ -391,7 +391,6 @@ def greedy_star(
         for r in np.flatnonzero(flag):  # A11: no decision rests on an unconverged device solve
             d[r], t3[r], a[r], b[r] = host_score(i[r], j[r])
             host[r] = True
-        n["unrescored"] += int(np.sum(flag & ~host))
         n["scores"] += P
         n["host"] += int(host.sum())
         store.d[idx], store.t3[idx], store.a[idx], store.b[idx], store.host[idx] = d, t3, a, b, host
@@ -522,6 +521,7 @@ def greedy_star(
             t_new = np.asarray(res.t, np.float64)[:C]
         else:  # upstream's BFGS fallback in the fp64 reference (TH:5005-5016)
             t_new = ref_star.star_em(table.x64(kids), table.v64(kids), cfg.star_tol, STAR_MAX_SWEEPS)[0]
+            n["star_fb"] += 1
         old = acc.message()
         table.t[kids] = t_new
         acc = build_acc()

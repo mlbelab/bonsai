@@ -495,51 +495,6 @@ def test_retime_cache_entry_with_another_code_hash_is_a_miss(tmp_path, monkeypat
     assert gate_mod.retime_cached(*_TREE, _XX, _XX, None, tmp_path)[1] is False and calls == [None, None]
 
 
-def _a16e_entry(cache, parent, t, names, leaf, code="a16e-code", status="converged"):
-    """A pre-A16f cache entry: a converged RetimeResult in the A16e layout plus its code hash, under the A16e key."""
-    key = gate_mod._key(parent, t, names, leaf, gate_mod._A16E_CONSTANTS, code)
-    tt = np.array([0.0, np.exp(-15.0), 0.3])  # edge 1 at the box floor (exp of the bound)
-    old = {"t": tt, "L": -1.5, "L_start": -3.0, "gap": 1e-6, "sum_abs_pg": 1e-3, "extra_dL": 2e-9, "cg_iters": 40,
-           "cg_converged": True, "curvature_stop": False, "nit": 1234, "restarts": 2, "status": status, "reason": "",
-           "code_hash": code}  # fmt: skip
-    cache.mkdir(exist_ok=True)
-    np.savez(cache / f"{key}.npz", **old)
-    return key, tt
-
-
-def test_a16e_cache_entry_is_migrated_to_an_endpoint(tmp_path, monkeypatch):
-    """An A16e entry (converged result, A16e key) is read as the endpoint: s = log t, which recovers the box edge
-    exactly (free_set compares s to the bound with <=), its counters kept, no L-BFGS run; it is then stored under
-    the new key and served from there."""
-    calls = []
-    _stub(monkeypatch, calls)
-    c = tmp_path / "cache"
-    old_key, tt = _a16e_entry(c, *_TREE)
-    _a16e_entry(c, np.array([-1, 0, 1]), *_TREE[1:], code="other-code")  # another tree, another code hash
-    rt, hit, key = gate_mod.retime_cached(*_TREE, _XX, _XX, None, c)
-    (ep,) = calls
-    assert hit is True and ep is not None and key != old_key
-    assert ep.s[0] == -15.0 and ep.s[1] == pytest.approx(np.log(0.3), rel=1e-15, abs=0)
-    assert (ep.L_start, ep.nit, ep.restarts, ep.extra_dL, ep.status_ok) == (-3.0, 1234, 2, 2e-9, True)
-    assert ep.history.shape == (0, 3) and old_key in ep.message
-    assert (c / f"{key}.npz").exists() and (c / f"{old_key}.npz").exists()
-    assert gate_mod.retime_cached(*_TREE, _XX, _XX, None, c)[1] is True and len(calls) == 1  # memo hit
-    new = gate_mod.retime.load_endpoint(c / f"{key}.npz")  # the migrated new-format entry
-    np.testing.assert_array_equal(new.s, ep.s)
-    assert old_key in new.message
-
-
-def test_a16e_entry_of_another_tree_or_invalid_is_not_used(tmp_path, monkeypatch):
-    calls = []
-    _stub(monkeypatch, calls)
-    c = tmp_path / "cache"
-    _a16e_entry(c, *_TREE[:3], "other-leaves")
-    assert gate_mod.retime_cached(*_TREE, _XX, _XX, None, c)[1] is False and calls == [None]
-    d = tmp_path / "cache2"
-    _a16e_entry(d, *_TREE, status="invalid")
-    assert gate_mod.retime_cached(*_TREE, _XX, _XX, None, d)[1] is False and calls == [None, None]
-
-
 def test_recheck_rewrites_reports_from_cached_endpoints(tmp_path, monkeypatch):
     """--recheck: every existing report of the manifest is re-evaluated from the cached endpoints (no L-BFGS),
     tagged A16f, the old report kept under ``superseded`` (the original one on a repeat); lines without a
@@ -803,31 +758,38 @@ def test_recheck_runs_the_escape_for_arms_that_now_need_it(tmp_path, monkeypatch
 
 @pytest.mark.slow
 def test_a16f_memo_entry_written_before_a16g_still_hits(tmp_path, monkeypatch):
-    """The perturb_ctrl_sub upstream endpoint and its A16f memo entry, written by the A16f recheck (db2a6d6 code, report
-    acceptance_hash 885b198a...), copied out of data/m2_gate: ``retime_cached`` serves the memo under A16g with no
-    subprocess (no Hessian rebuild), and the result is the recorded A16f one."""
+    """The perturb_ctrl_sub upstream endpoint and its A16f memo entry, written by the A16f recheck (db2a6d6 code,
+    acceptance_hash 885b198a...) and frozen from data/m2_gate/retime_cache into the a16g fixtures: ``retime_cached``
+    serves the memo under A16g with no subprocess (no Hessian rebuild), and the result is the A16f saddle verdict
+    (status invalid, two flat directions, flat gain 1.8942e-3 as recorded by the A16f recheck; rel 1e-3 as in the
+    a16f tests)."""
+    import os
     import shutil
 
     from bench.run import _leaf_arrays
 
     from bonsai._ref.newick import parse_newick
 
-    root = Path(__file__).resolve().parents[2] / "data"
-    up_dir, cache, report = (root / "perturb_ctrl_sub/bonsai_workdir/results", root / "m2_gate/retime_cache",
-                             root / "m2_gate/upstream/perturb_ctrl_sub.json")  # fmt: skip
-    if not (up_dir.exists() and report.exists()):
-        pytest.skip("perturb_ctrl_sub arm or its A16f report not available")
-    old = json.loads(report.read_text())
-    key = old["arm"]["retime_cache_key"]
-    for f in [cache / f"{key}.npz", *cache.glob(f"{key}.acc-*.npz")]:
-        shutil.copy(f, tmp_path / f.name)
+    ws = Path(__file__).resolve().parents[2]
+    up_dir = ws / "data/perturb_ctrl_sub/bonsai_workdir/results"
+    # env BONSAI_FIXTURES as in test_bench_retime (the a16f directory; a16g sits next to it)
+    memo = Path(os.environ.get("BONSAI_FIXTURES", ws / "data/test_fixtures/a16f")).parent / "a16g/memo"
+    files = sorted(memo.glob("*.npz")) if memo.is_dir() else []
+    if not (up_dir.exists() and len(files) == 2):
+        pytest.skip("perturb_ctrl_sub arm or its frozen A16f memo entry not available")
+    key = next(f.stem for f in files if ".acc-" not in f.name)
+    for f in files:
+        shutil.copyfile(f, tmp_path / f.name)
     up = load_arm(up_dir)
     p, t, nm = parse_newick(up["stage_newick"]["redo_starry"])
     X, V = _leaf_arrays(p, nm, up["cells"], up["x"], up["var"])
     monkeypatch.setattr(gate_mod, "retime_subprocess", lambda *a, **k: pytest.fail("acceptance (Hessian) rebuilt"))
     rt, hit, key2 = gate_mod.retime_cached(p, t, nm, up["leaf_sha256"], X, V, None, tmp_path)
-    assert (hit, key2) == (True, key) and old["acceptance_hash"] == gate_mod.acceptance_hash()
-    assert (rt.status, rt.gap, rt.L) == ("invalid", old["arm"]["retime"]["gap"], old["arm"]["retime"]["L"])
+    assert (hit, key2) == (True, key)
+    assert gate_mod.acceptance_hash() == "885b198a00ddd6ccc7b4e4ed9c523346f0c5750229ee936d95adb2ec77e03090"
+    assert (rt.status, rt.n_flat) == ("invalid", 2)
+    assert rt.gap_flat == pytest.approx(1.8942e-3, rel=1e-3, abs=0)
+    assert sorted(f.name for f in tmp_path.iterdir()) == [f.name for f in files]  # a hit writes nothing new
 
 
 def test_stored_escape_state_is_ignored_once_the_original_passes(tmp_path, monkeypatch):
@@ -842,3 +804,18 @@ def test_stored_escape_state_is_ignored_once_the_original_passes(tmp_path, monke
     rt, _, _, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
     assert (rt.status, rt.L, esc["n_escapes"], esc["escapes"], len(steps)) == ("converged", 7.0, 0, [], 1)
     assert calls[-1].nit == 7  # only the original endpoint was re-accepted
+
+
+def test_scale_guard_fails_fast_before_lbfgs(tmp_path, monkeypatch):
+    """A tree whose dense acceptance Hessian (n_edges²·8 B) exceeds RETIME_HESS_MAX_BYTES is INVALID with the guard's
+    reason before any subprocess or cache write; at exactly the budget it runs. _TREE has 2 edges: 32 B."""
+    assert 8 * (2 * 10_000) ** 2 <= gate_mod.RETIME_HESS_MAX_BYTES  # the default admits 10k-leaf gates (< 2N edges)
+    calls = []
+    _stub(monkeypatch, calls)
+    monkeypatch.setattr(gate_mod, "RETIME_HESS_MAX_BYTES", 31.0)
+    rt, hit, key, esc = gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)
+    assert (rt.status, hit, key, esc["n_escapes"], calls) == ("invalid", None, None, 0, [])
+    assert "scale guard" in rt.reason and "2 edges" in rt.reason and np.isnan(rt.L)
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setattr(gate_mod, "RETIME_HESS_MAX_BYTES", 32.0)
+    assert gate_mod.retime_escaped(*_TREE, _XX, _XX, None, tmp_path)[0].status == "converged" and calls == [None]

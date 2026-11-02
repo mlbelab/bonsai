@@ -74,8 +74,13 @@ if [[ ! -f bench/slurm/gate.sbatch ]] || ! git rev-parse --is-inside-work-tree >
        "under $(pwd), or not a git checkout). Submit from the worktree created per this script's header." >&2
   exit 1
 fi
-if [[ -n "${SWEEP_SHA:-}" && "$(git rev-parse HEAD)" != "$SWEEP_SHA" ]]; then
-  echo "error: worktree HEAD $(git rev-parse HEAD) is not the pinned SWEEP_SHA $SWEEP_SHA" >&2
+sha="${SWEEP_SHA:?SWEEP_SHA not set: pin the reviewed sha, see the header}"
+if [[ "$(git rev-parse HEAD)" != "$sha" ]]; then
+  echo "error: worktree HEAD $(git rev-parse HEAD) is not the pinned SWEEP_SHA $sha" >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then  # tracked edits would run unreviewed code
+  echo "error: the worktree has uncommitted changes to tracked files; the run would not be the pinned sha" >&2
   exit 1
 fi
 

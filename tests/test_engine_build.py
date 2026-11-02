@@ -1,6 +1,8 @@
 """Greedy tree builder and redo starry (``bonsai._engine.build``; plan M2 Task 7, A18, A21b, A24). The fp64
 brute-force reference ``bonsai._ref.greedy`` is the oracle."""
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -101,15 +103,37 @@ def built11():
 
 
 @pytest.mark.x64
+@pytest.mark.parametrize("mode", ["sequential", "joint"])
 @pytest.mark.parametrize("seed", [11, 13])
-def test_greedy_tree_matches_reference_x64(seed):
+def test_greedy_tree_matches_reference_x64(seed, mode):
     x, var = _leaves(N, seed)
-    b = greedy_tree(x, var, _names(N), EXACT, dtype=jnp.float64)
-    ref, events, info = rg.greedy_tree(x, var, star_tol=EXACT.star_tol)
+    b = greedy_tree(x, var, _names(N), replace(EXACT, mode=mode), dtype=jnp.float64)
+    ref, events, info = rg.greedy_tree(x, var, mode=mode, star_tol=EXACT.star_tol)
     assert [_key(e) for e in b.stats["events"]] == [_key(e) for e in events]
-    assert b.stats["passes"] == info["passes"] and b.stats["n_flagged_used_unrescored"] == 0
+    assert b.stats["passes"] == info["passes"] and b.stats["n_star_fallbacks"] == 0
     _assert_same_tree(_clades(b.parent, b.t, N), _ref_clades(ref, N, N))
     _assert_same_tree(_newick_clades(b.stage_newick["greedy"], _names(N)), _ref_clades(info["greedy"], N, N))
+
+
+@pytest.mark.x64
+@pytest.mark.parametrize("module", [build, eg])  # the leaf star EM, the first reopt of the root greedy
+def test_star_em_fallback_is_counted_and_matches_reference_x64(module, monkeypatch):
+    """A device star EM that reports converged=False falls back to the fp64 ``_ref`` star EM: counted once in
+    ``n_star_fallbacks``, and the tree still equals the reference (as in ``test_greedy_tree_matches_reference_x64``)."""
+    x, var = _leaves(N, 11)
+    real, calls = module.star_em, []
+
+    def first_fails(*a, **k):
+        res = real(*a, **k)
+        calls.append(1)
+        return res._replace(converged=jnp.asarray(False)) if len(calls) == 1 else res
+
+    monkeypatch.setattr(module, "star_em", first_fails)
+    b = greedy_tree(x, var, _names(N), EXACT, dtype=jnp.float64)
+    ref, events, info = rg.greedy_tree(x, var, star_tol=EXACT.star_tol)
+    assert len(calls) >= 1 and b.stats["n_star_fallbacks"] == 1
+    assert [_key(e) for e in b.stats["events"]] == [_key(e) for e in events]
+    _assert_same_tree(_clades(b.parent, b.t, N), _ref_clades(ref, N, N))
 
 
 def _zero_edge_fixture():

@@ -2,6 +2,7 @@
 A20, A21b). The fp64 brute-force reference ``bonsai._ref.greedy`` is the oracle."""
 
 import functools
+from dataclasses import replace
 
 import jax.numpy as jnp
 import numpy as np
@@ -113,12 +114,9 @@ def test_constants_match_reference():
         "REDO_TIME_MIN",
         "REDO_NN_FRAC",
         "REDO_NN_MIN",
-        "NN_MIN_CHILDREN",
-        "LAZY_MIN_CHILDREN",
         "STAR_TOL",
         "STAR_MAX_SWEEPS",
         "STAR_T_MAX",
-        "K_NN",
     ]
     assert {k: getattr(eg, k) for k in names} == {k: getattr(rg, k) for k in names}
     assert [eg.max_passes(n) for n in (1, 2, 8, 1000)] == [rg.max_passes(n) for n in (1, 2, 8, 1000)] == [1, 1, 7, 999]
@@ -157,9 +155,10 @@ def _pair_scale(ref_tree, entry, i, j, t3) -> float:
 
 
 @pytest.mark.x64
+@pytest.mark.parametrize("mode", ["sequential", "joint"])
 @pytest.mark.parametrize("name", FIXTURES)
-def test_engine_matches_reference_x64(name):
-    stats, eng_trace, table, ref_events, ref_trace, ref_tree = _run(name, EXACT, jnp.float64)
+def test_engine_matches_reference_x64(name, mode):
+    stats, eng_trace, table, ref_events, ref_trace, ref_tree = _run(name, replace(EXACT, mode=mode), jnp.float64)
     assert [_key(e) for e in stats.events] == [_key(e) for e in ref_events]
     _assert_special_air(eng_trace, ref_trace, table, ref_tree, stats.events, ref_events)
     assert any(e.kind == "reopt" for e in ref_events) == (name != "nonroot")  # the periodic reopt is exercised
@@ -172,7 +171,6 @@ def test_engine_matches_reference_x64(name):
             entry = ref_trace[rounds[k]]
             scale = _pair_scale(ref_tree, entry, b.i, b.j, entry[0][b.i, b.j][1])
             assert abs(a.dlogl - b.dlogl) <= (G + 64) * EPS64 * scale, (k, a.dlogl, b.dlogl)
-    assert stats.n_flagged_used_unrescored == 0
 
 
 def _assert_special_air(eng_trace, ref_trace, table, ref_tree, eng_events, ref_events) -> None:
@@ -259,7 +257,6 @@ def _assert_parent_state(trace, table, outside) -> None:
 
 def _check_fp32(name: str):
     stats, eng_trace, table, ref_events, ref_trace, ref_tree = _run_cached(name, FP32, jnp.float32)
-    assert stats.n_flagged_used_unrescored == 0
     # exhaustive rounds (bounds off): every pair of the current children is freshly scored before each decision; in a
     # special-child round (counter < 0, A18b) every pair with the special child: C − 1
     sizes = [(len(e[0]), len(e[1]), e[4] < 0) for e in eng_trace if e[0]]
@@ -344,7 +341,7 @@ def test_flagged_pairs_rescored_on_host(monkeypatch, kind):
 
     monkeypatch.setattr(eg, "pair_score", flag)
     stats, trace, table2 = run()
-    assert calls["n"] == 1 and stats.n_host_rescored == 1 and stats.n_flagged_used_unrescored == 0
+    assert calls["n"] == 1 and stats.n_host_rescored == 1
     _, tk, xr, Wr, _ = trace[0]
     x64 = table2.x[: 12 + 1].astype(np.float64)
     v64 = table2.v[: 12 + 1].astype(np.float64)

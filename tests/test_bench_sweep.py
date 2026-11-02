@@ -237,7 +237,8 @@ def _gate(tmp_path, name, greedy_warm):
     ]
     (run / "results.json").write_text(json.dumps({"runs": runs}))
     gate = {"jax": str(run), "n_cells": 10, "n_genes": 10, "invalid_arms": [], "verdict": "PASS", "a1_per_entry": 0.0, "a1_pass": True,
-            "a7_diff": None, "a7_pass": None, "arms": {"jax": _arm(False), "upstream": _arm(True)}}  # fmt: skip
+            "a7_diff": None, "a7_pass": None, "arms": {"jax": _arm(False), "upstream": _arm(True)},
+            "acceptance_hash": sweep._report_hash()}  # fmt: skip
     gp = tmp_path / f"gate_{name}.json"
     gp.write_text(json.dumps(gate))
     return run, gp
@@ -332,3 +333,21 @@ def test_upstream_invalid_arm_blocks_decisions_through_aggregate(tmp_path, inval
     g["invalid_arms"] = ["jax"]
     gp.write_text(json.dumps(g))
     assert sweep.load_row(line)["status"] == "jax_invalid"
+
+
+def test_stale_reports_are_listed_and_never_decided_on(tmp_path):
+    """A gate or upstream report whose acceptance_hash is not the current report_hash is STALE: listed under INVALID /
+    missing, ineligible (an R1 setting with a stale case is not decided on), and a stale upstream_invalid gate does not
+    block."""
+    _, gp = _gate(tmp_path, "x", 1.0)
+    g = json.loads(gp.read_text()) | {"invalid_arms": ["upstream"], "verdict": "INVALID", "acceptance_hash": "old"}
+    gp.write_text(json.dumps(g))
+    line = {"id": 0, "kind": "jax", "case": "golden", "setting": "sequential_M256_m1", "mode": "sequential", "rescore_top": 256, "merges": 1, "gate_out": str(gp)}  # fmt: skip
+    assert sweep.load_row(line)["status"] == "stale"
+    (tmp_path / "u.json").write_text(json.dumps({"status": "converged", "acceptance_hash": "old"}))
+    up = {"id": 1, "kind": "upstream", "case": "golden", "gate_out": str(tmp_path / "u.json")}
+    sweep.write_manifest([line, up], tmp_path / "m.tsv")
+    dec = sweep.aggregate([tmp_path / "m.tsv"], tmp_path / "o.md")
+    md = (tmp_path / "o.md").read_text().split("## INVALID / missing")[1]
+    assert "- golden sequential_M256_m1: STALE (INVALID)" in md and "- upstream-only golden: STALE" in md
+    assert dec["blocked"] == [] and dec["R1"] is None and any("golden: STALE" in n for n in dec["notes"])

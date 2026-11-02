@@ -705,11 +705,8 @@ def test_endpoint_round_trip_and_accept_from_it(tmp_path):
 # --- A16f on the stored real endpoints (the eeccg/a16c diagnostics); skipped where the files are absent.
 
 _BONSAI = Path(__file__).resolve().parents[2]
-_FIXTURES = Path(  # env BONSAI_FIXTURES overrides (the directory holding the a16f endpoint files)
-    os.environ.get(
-        "BONSAI_FIXTURES", "/projects/site/pred/ihb-g-mlbe/USERS/fleckj/projects/bonsai/data/test_fixtures/a16f"
-    )
-)
+# env BONSAI_FIXTURES overrides (the directory holding the a16f endpoint files)
+_FIXTURES = Path(os.environ.get("BONSAI_FIXTURES", _BONSAI / "data/test_fixtures/a16f"))
 
 
 def _real_case(which):
@@ -723,17 +720,17 @@ def _real_case(which):
             _BONSAI / "data/eec_vasa_sub/bonsai_workdir/results",
             _FIXTURES / "lbfgs_ckpt_sequential.npz",
         )
-        runs = _BONSAI / "data/m2_gate/runs/eec_vasa_sub_sequential_M256_m1"
+        runs = _FIXTURES / "eec_vasa_sub_sequential_M256_m1"  # its results.json, frozen from data/m2_gate/runs
     else:
         up_dir, ep_file = (
-            _BONSAI / "bonsai-m2-baselines2/bench/results/upstream_redo_sim_1k_s1",
+            _BONSAI / "data/m2_baselines/results_baselines2/upstream_redo_sim_1k_s1",
             _FIXTURES / "lbfgs_ckpt_1k_s1.npz",
         )
         runs = None
     if not (up_dir.exists() and ep_file.exists() and (runs is None or runs.exists())):
         pytest.skip(f"stored {which} endpoint or its arms not available")
     up = load_arm(up_dir if which == "eec" else next(p for p in up_dir.iterdir() if p.is_dir()))
-    arm = up if runs is None else load_arm(next(p for p in runs.iterdir() if p.is_dir()), load_arrays=False)
+    arm = up if runs is None else load_arm(runs, load_arrays=False)
     p, t, nm = parse_newick(arm["stage_newick"]["redo_starry"])
     X, V = _leaf_arrays(p, nm, up["cells"], up["x"], up["var"])
     with np.load(ep_file) as z:
@@ -785,7 +782,7 @@ def test_a16g_escapes_the_saddle_of_perturb_ctrl_sub_upstream():
     Newton part 2e-7. The escape moves to the best measured point and resumes L-BFGS; the acceptance then passes within
     the cap. L-BFGS-B never lowers L, so L rises by at least the measured joint gain, up to rounding: L ≈ −1.8e5, engine
     and `_ref` sums agree to ~eps·|L|·log(N·G) ≈ 1e-10, and 1e-6 (0.06% of the bound) is far above it. Reference
-    values from the A16f report (data/m2_gate/upstream/perturb_ctrl_sub.json): rel 1e-3 as in the a16f tests."""
+    values from the A16f recheck (its memo entry is frozen in the a16g fixtures): rel 1e-3 as in the a16f tests."""
     from bench.gate import load_arm
     from bench.run import _leaf_arrays
 

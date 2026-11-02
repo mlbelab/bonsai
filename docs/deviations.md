@@ -284,3 +284,25 @@ re-optimisation at the root every max(⌊0.05·C⌋, 10) merges (TH:1154, 2354),
   64 2298 s, 1024 2479 s). R3: `merges_per_round` m = 1 stays the M2 default (R3 is report only); reported: m = 4 fails A7 on
   sim10k_s1, m = 16 fails A1 on golden and A7 on sim1k_s0 and sim10k_s0. `_ref` and `_ref.pair.pair_score` keep upstream's sequential default; tests compared with `_ref` pin
   `mode="sequential"`. The frozen `bench/configs/jax_*.toml` are unchanged (the sweep sets the mode per line).
+- A17 R2 timing ran as separate A100 jobs, one per 10k seed, each running its three M runs (64, 256, 1024)
+  back to back on one GPU (one cold and one warm each), as the Task 9 infra ruling allowed.
+- Re-timer acceptance (A16f, A16g) is an estimate of the remaining local gain, not a certificate. It misses (i) the
+  gain L-BFGS makes after leaving a saddle whose measured gain sits below the escape trigger, (ii) exponential tails
+  in s ∈ [−9, −5] and near the upper box bound, which the floor term (s < −9) and the Newton part do not see, and
+  (iii) any global optimality. The M2 verdicts are unaffected: the A1 margins are 1.9e-3 to 1.4e-2 per entry against
+  the 1e-6 slack. M3: consider escaping at 0.5·bound, extending the floor term to s < −5, and making asym > 1e-8
+  INVALID; deferred because each changes `acceptance_hash` and would invalidate the memoised 10k acceptances.
+- A24 false stops (the one-sided guard; `false_stop_check` counts, measurements in `data/m2_gate/measurements.md`):
+  sim10k_s0/s1/s2 sequential 1/3/2 stops with a band row whose fp64 d > 1e-6 (band rows 75/113/86); sim10k_s2 joint
+  M = 256, m = 16: 1; joint m = 1 at the default setting: 0. Decision: keep the one-sided guard, since the default
+  (joint) shows none.
+- Gate scale guard. `bench.gate` refuses, as INVALID before L-BFGS, a tree whose dense acceptance Hessian
+  (n_edges²·8 B) exceeds `RETIME_HESS_MAX_BYTES` = 16 GB (about 3 host copies in a 64 GB job, ≤ ~44.7k edges).
+  It lives in the gate driver, outside the hashed acceptance code.
+- M4 scale list. (i) The device star EM's scratch is about 165-300 B per C·G entry, 43-84 GB at 100k cells × 2k
+  genes; fix by evaluating the brackets sequentially. (ii) The dense re-timer Hessian is about 260 GB at 100k, so the
+  A16f gate is limited to about 20k leaves. (iii) The fp64 star EM fallback (`_ref`) runs BFGS with a dense C × C
+  matrix, about 80 GB at 100k.
+- M3 cost notes. About 85% of the 10k greedy time is per-call overhead (about 37 ms per `pair_score` call); about
+  23k new-pair calls could be folded into the rescore batches; the pair Newton solve runs a fixed 60 iterations;
+  dsum pads G to a power of two; each merge pays host store costs.

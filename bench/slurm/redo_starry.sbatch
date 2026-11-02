@@ -12,8 +12,9 @@
 # No `#SBATCH --array` line: the two sizes are submitted separately, the 10k batch only after the
 # 1k wall times are seen (Q3 ruling: revisit the 10k limit if a 1k job exceeds 3h).
 #
-#   sbatch --array=0-2 bench/slurm/redo_starry.sbatch   # 1k, seeds 0,1,2
-#   sbatch --array=3-5 bench/slurm/redo_starry.sbatch   # 10k, seeds 0,1,2
+#   exp=ALL,BASELINE_SHA=$(git rev-parse HEAD)   # required; the tracked tree must be clean
+#   sbatch --export=$exp --array=0-2 bench/slurm/redo_starry.sbatch   # 1k, seeds 0,1,2
+#   sbatch --export=$exp --array=3-5 bench/slurm/redo_starry.sbatch   # 10k, seeds 0,1,2
 #
 #SBATCH --job-name=bonsai-m2-redo-starry
 #SBATCH --partition=batch_cpu
@@ -35,6 +36,15 @@ if [[ ! -f bench/slurm/redo_starry.sbatch ]] || ! git rev-parse --is-inside-work
   echo "error: not running from the dedicated baseline worktree's repo root" \
        "(bench/slurm/redo_starry.sbatch not found under \$(pwd), or \$(pwd) is not a git checkout)." \
        "Submit from the worktree created per this script's header comment." >&2
+  exit 1
+fi
+sha="${BASELINE_SHA:?BASELINE_SHA not set: pin the reviewed sha, see the header}"
+if [[ "$(git rev-parse HEAD)" != "$sha" ]]; then
+  echo "error: worktree HEAD $(git rev-parse HEAD) is not the pinned BASELINE_SHA $sha" >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then  # tracked edits would run unreviewed code
+  echo "error: the worktree has uncommitted changes to tracked files; the run would not be the pinned sha" >&2
   exit 1
 fi
 

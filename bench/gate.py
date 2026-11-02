@@ -7,8 +7,7 @@ into the cache, ``--retime-cache`` required).
 ``--retime-cache DIR`` stores each re-time's L-BFGS endpoint (``bench.retime.Endpoint``, whatever its status) under a
 sha256 of the tree, ``leaf_sha256``, the L-BFGS constants and box, and the code hash of the endpoint computation
 (``code_hash``), so an identical tree runs L-BFGS once across runs; the A16f acceptance is memoised separately under
-(endpoint key, endpoint, ``acceptance_hash``), so it reruns whenever the acceptance code changes. Entries written before A16f (converged results only, keyed with the A16e
-constants and code hash) are read as endpoints and migrated to the new key. Writes are atomic (concurrent array tasks
+(endpoint key, endpoint, ``acceptance_hash``), so it reruns whenever the acceptance code changes. Writes are atomic (concurrent array tasks
 may duplicate work, never corrupt an entry).
 
 A16g (``retime_escaped``, on top of ``retime_cached``): the escape decision is read from the memoised A16f acceptance
@@ -43,7 +42,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +63,13 @@ from .sweep import read_manifest
 
 A1_MIN_PER_ENTRY = -1e-6  # A1: (L_jax − L_up)/(N·G) ≥ −1e-6
 A7_MIN_DIFF = -0.01  # A7: quartet accuracy at most 1 percentage point below upstream
+# Scale guard (outside the hashed acceptance code): the A16f acceptance holds the dense free-set Hessian (n_edges² fp64,
+# n_free ≤ n_edges), its symmetrised copy and eigh's eigenvectors on the host, about 3 copies. The gate jobs have 64 GB
+# (gate.sbatch --mem=64G): 16 GB per copy (48 GB in all) leaves room for the rest, i.e. n_edges ≤ ~44.7k, so 10k-leaf
+# gates (< 2·10⁴ edges, 3.2 GB) fit; 100k (~1.8-2·10⁵ edges, ~260-320 GB) does not (M4 scale item, docs/deviations.md).
+# Host copies only: a GPU eigh also holds H and U on the device (~32 GB at the cap), so near the cap use an A100 80 GB
+# or the CPU eigh; it fails loudly either way.
+RETIME_HESS_MAX_BYTES = 16e9
 
 
 def gate_verdict(L_jax, L_up, n_cells, n_genes, q_jax=None, q_up=None) -> dict:
@@ -125,12 +131,6 @@ _ACCEPT_CODE = (
     "RetimeResult", "times_of", "_objective", "_bound", "_grad_scale", "free_set", "line_gain", "joint_gain",
     "gap_terms", "free_hessian", "eigh", "accept",
 )  # fmt: skip
-# The A16e key constants: entries written before A16f were keyed with these (and the A16e code hash they store).
-_A16E_CONSTANTS = {
-    "OPTIONS": {"ftol": 0.0, "gtol": 1e-12, "maxiter": 15000, "maxfun": 30000}, "MAX_RESTARTS": 10, "MAX_CG": 2000,
-    "FD_H": 1e-4, "L_MATCH_REL": 1e-10, "GAP_FRAC": 1e-2, "CG_GAP_REL": 1e-3, "CG_GAP_WINDOW": 50, "CG_RES_GAP": 1e-3,
-    "CG_RES": 1e-6, "CG_GAP_BOUND_FRAC": 0.1, "CURV_REL": 1e-10, "LOG_T_MIN": -15.0, "LOG_T_MAX": 15.0,
-}  # fmt: skip
 
 
 def code_hash() -> str:
@@ -235,40 +235,13 @@ def _load_entry(f: Path, code: str) -> Endpoint | None:
     return retime.load_endpoint(f)
 
 
-def _a16e_endpoint(cache_dir: Path, parent, t, names, leaf_sha: str) -> Endpoint | None:
-    """The endpoint of a pre-A16f entry for this tree, or ``None``.
-
-    Such an entry is a converged ``RetimeResult`` (so every scipy status was 0, 1 or 2) plus the A16e code hash,
-    under the key of the A16e constants and that hash; its restart history was not recorded.
-    """
-    codes = set()
-    for f in Path(cache_dir).glob("*.npz"):
-        with np.load(f) as z:
-            if "cg_iters" in z.files:
-                codes.add(z["code_hash"].item())
-    for code in sorted(codes):
-        f = Path(cache_dir) / f"{_key(parent, t, names, leaf_sha, _A16E_CONSTANTS, code)}.npz"
-        if not f.exists():
-            continue
-        with np.load(f) as z:
-            if z["status"].item() != "converged":
-                continue
-            s = np.log(z["t"][np.asarray(parent) >= 0])  # A16e stored t = exp(s); log(exp(±15)) == ±15 exactly
-            ctr = {k: z[k].item() for k in ("L_start", "nit", "restarts", "extra_dL")}
-        return Endpoint(
-            s=s, **ctr, status_ok=True, message=f"migrated A16e cache entry {f.stem}", history=np.zeros((0, 3))
-        )
-    return None
-
-
 def retime_cached(
     parent, t, names, leaf_sha, x, var, device, cache_dir
 ) -> tuple[RetimeResult, bool | None, str | None]:
     """(result, endpoint cache hit, key).
 
     Without ``cache_dir`` always re-times (hit and key ``None``). Every endpoint is stored whatever its status
-    (a migrated A16e endpoint too, under the new key; an endpoint saved before a failed acceptance too, then the
-    error is re-raised). The acceptance is memoised under (endpoint key, endpoint, ``acceptance_hash``), so an
+    (an endpoint saved before a failed acceptance too, then the error is re-raised). The acceptance is memoised under (endpoint key, endpoint, ``acceptance_hash``), so an
     arm shared by several gates is accepted once per acceptance code.
     """
     if cache_dir is None:
@@ -278,24 +251,31 @@ def retime_cached(
     code = code_hash()
     ep = _load_entry(f, code) if f.exists() else None
     hit = ep is not None
-    if not hit:
-        ep = _a16e_endpoint(cache_dir, parent, t, names, leaf_sha) if Path(cache_dir).is_dir() else None
-    if ep is not None and (acc := _acceptance_file(cache_dir, key, ep)).exists():
+    if hit and (acc := _acceptance_file(cache_dir, key, ep)).exists():
         with np.load(acc) as z:
             rt = retime._fields(z, RetimeResult)
-        if not hit:
-            _savez_atomic(f, **asdict(ep), code_hash=code)
         return rt, True, key
     try:
         rt, ep_out = retime_subprocess(parent, t, x, var, device, endpoint=ep)
     except subprocess.CalledProcessError as err:
-        if not hit and (ep or getattr(err, "endpoint", None)) is not None:
-            _savez_atomic(f, **asdict(ep or err.endpoint), code_hash=code)
+        if not hit and getattr(err, "endpoint", None) is not None:
+            _savez_atomic(f, **asdict(err.endpoint), code_hash=code)
         raise
     if not hit:
         _savez_atomic(f, **asdict(ep_out), code_hash=code)
     _savez_atomic(_acceptance_file(cache_dir, key, ep_out), **asdict(rt))
-    return rt, ep is not None, key
+    return rt, hit, key
+
+
+def _too_large(t, n_edges: int) -> RetimeResult:
+    """An INVALID result for a tree whose dense acceptance Hessian exceeds ``RETIME_HESS_MAX_BYTES`` (nothing run)."""
+    nan = {f.name: np.nan for f in fields(RetimeResult)}
+    reason = (
+        f"scale guard: dense Hessian of {n_edges} edges needs {8.0 * n_edges**2 / 1e9:.1f} GB"
+        f" > RETIME_HESS_MAX_BYTES {RETIME_HESS_MAX_BYTES / 1e9:.0f} GB; not re-timed"
+    )
+    ints = dict.fromkeys(("n_floor", "n_flat", "n_free", "nit", "restarts"), 0)
+    return RetimeResult(**nan | ints | {"t": np.asarray(t, np.float64), "status": "invalid", "reason": reason})
 
 
 def retime_escaped(
@@ -309,6 +289,9 @@ def retime_escaped(
     on later runs. ``escapes``: n_escapes, L_escape_gain (final L minus L before the first escape) and the acceptance
     after each escape. Without ``cache_dir`` nothing is stored.
     """
+    n_edges = int(np.sum(np.asarray(parent) >= 0))
+    if 8.0 * n_edges**2 > RETIME_HESS_MAX_BYTES:  # fail before L-BFGS: the acceptance could never run
+        return _too_large(t, n_edges), None, None, {"n_escapes": 0, "L_escape_gain": 0.0, "escapes": []}
     if cache_dir is None:
         rt, ep = retime_subprocess(parent, t, x, var, device)
         hit = key = ef = None

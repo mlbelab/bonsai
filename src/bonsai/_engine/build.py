@@ -180,15 +180,15 @@ def _compact(parent: np.ndarray, t: np.ndarray, N: int, root: int, names: list[s
     return p, tt, list(names) + [f"internal_{k}" for k in range(n_int)] + ["root"]
 
 
-def _leaf_star_times(table: NodeTable, N: int, cfg: GreedyConfig) -> np.ndarray:
-    """Star EM on the N leaves (device, padded to bucket(N)); upstream's BFGS fallback in the fp64 reference."""
+def _leaf_star_times(table: NodeTable, N: int, cfg: GreedyConfig) -> tuple[np.ndarray, bool]:
+    """(times, fell back): star EM on the N leaves (device, padded to bucket(N)); fp64 ``_ref`` fallback (BFGS)."""
     Nb, G = _bucket(N), table.x.shape[1]
     xs, vs = np.zeros((Nb, G), table.dtype), np.ones((Nb, G), table.dtype)
     xs[:N], vs[:N] = table.x[:N], table.v[:N]
     res = star_em(jnp.asarray(xs), jnp.asarray(vs), jnp.asarray(np.arange(Nb) < N), cfg.star_tol, STAR_MAX_SWEEPS)
     if bool(res.converged):
-        return np.asarray(res.t, np.float64)[:N]
-    return ref_star.star_em(table.x64(np.arange(N)), table.v64(np.arange(N)), cfg.star_tol, STAR_MAX_SWEEPS)[0]
+        return np.asarray(res.t, np.float64)[:N], False
+    return ref_star.star_em(table.x64(np.arange(N)), table.v64(np.arange(N)), cfg.star_tol, STAR_MAX_SWEEPS)[0], True
 
 
 def greedy_tree(x, var, names, cfg: GreedyConfig = GreedyConfig(), dtype=jnp.float32) -> BuiltTree:
@@ -215,9 +215,10 @@ def greedy_tree(x, var, names, cfg: GreedyConfig = GreedyConfig(), dtype=jnp.flo
         return out
 
     def leaf_star():
-        table.t[:N] = _leaf_star_times(table, N, cfg)
+        table.t[:N], fell_back = _leaf_star_times(table, N, cfg)
+        return int(fell_back)
 
-    timed("star_em", leaf_star)
+    leaf_fb = timed("star_em", leaf_star)
     root_stats = timed("greedy", lambda: greedy_star(table, N, None, True, cfg))
     snap = table.parent.copy()
     _collapse(snap, table.t, table.is_cell, N, table.n)
@@ -229,6 +230,7 @@ def greedy_tree(x, var, names, cfg: GreedyConfig = GreedyConfig(), dtype=jnp.flo
     stage["redo_starry"] = to_newick(parent, t, all_names)
     tot = _totals([root_stats])
     stats = {k: tot[k] + redo[k] for k in tot} | {
+        "n_star_fallbacks": tot["n_star_fallbacks"] + redo["n_star_fallbacks"] + leaf_fb,
         "passes": redo["passes"],
         "zero_edges_collapsed": redo["zero_edges_collapsed"],
         "stage_s": stage_s,

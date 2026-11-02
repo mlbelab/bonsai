@@ -19,6 +19,7 @@ lines of the file). Output paths depend only on (case, setting) under ``--root``
 
 import argparse
 import csv
+import functools
 import glob
 import json
 import statistics
@@ -33,7 +34,7 @@ COLUMNS = (
 SEEDS = (0, 1, 2)
 CASES = ("golden", *(f"sim{k}_s{s}" for k in ("1k", "10k") for s in SEEDS), "eec_vasa_sub", "perturb_ctrl_sub")
 REAL = ("eec_vasa_sub", "perturb_ctrl_sub")
-BASELINES = metadata.REPO.parent / "bonsai-m2-baselines2" / "bench" / "results"
+BASELINES = metadata.REPO.parent / "data" / "m2_baselines" / "results_baselines2"  # upstream_redo_sim_*
 DATA = metadata.REPO.parent / "data"
 DEFAULT_ROOT = metadata.REPO.parent / "m2-gate-sweep"
 CONFIG = {"golden": "jax_golden", "1k": "jax_sim_1k", "10k": "jax_sim_10k", "real": "jax_real"}
@@ -169,7 +170,7 @@ def decide(table: list[dict], timings: dict | None = None, cases=CASES) -> dict:
 
     ``timings[(case, mode, M)]`` is the warm greedy-stage time of the interleaved check-off R2 runs (10k seeds).
 
-    ``status`` is ``ok`` / ``jax_invalid`` / ``upstream_invalid`` / ``missing``. An INVALID upstream arm
+    ``status`` is ``ok`` / ``jax_invalid`` / ``upstream_invalid`` / ``missing`` / ``stale`` (ineligible). An INVALID upstream arm
     blocks every decision (A17: resolved before any mode is judged). Exact ties on the R2 median take the
     smaller M. R3 only reports pass/fail per m (m = 1 stays the default).
     """
@@ -238,8 +239,24 @@ def _results(run_dir) -> dict | None:
     return json.loads(p.read_text()) if p.exists() else None
 
 
+@functools.cache
+def _report_hash() -> str:
+    from .gate import report_hash  # imports the engine; only aggregation needs it
+
+    return report_hash()
+
+
+def _stale(report: dict) -> bool:
+    """A gate/upstream report written by other acceptance or escape code than the current one."""
+    return report.get("acceptance_hash") != _report_hash()
+
+
 def load_row(line: dict) -> dict:
-    """One jax manifest line -> a flat row (``status`` missing if there is no gate.json)."""
+    """One jax manifest line -> a flat row.
+
+    ``status`` is missing if there is no gate.json, stale if its ``acceptance_hash`` is not the current
+    ``bench.gate.report_hash()`` (listed, never decided on).
+    """
     row = {
         "case": line["case"],
         "setting": line["setting"],
@@ -256,7 +273,7 @@ def load_row(line: dict) -> dict:
     stats = res["runs"][0]["stats"] if res else {}
     arms = {k: g["arms"][k] for k in ("jax", "upstream")}
     return row | {
-        "status": "upstream_invalid" if "upstream" in inv else "jax_invalid" if inv else "ok",
+        "status": "stale" if _stale(g) else "upstream_invalid" if "upstream" in inv else "jax_invalid" if inv else "ok",
         "verdict": g["verdict"],
         "a1": g["a1_per_entry"], "a1_pass": g["a1_pass"], "a7": g["a7_diff"], "a7_pass": g["a7_pass"],
         "L_pe": arms["jax"]["retime"]["L"] / (g["n_cells"] * g["n_genes"]),
@@ -381,7 +398,10 @@ def aggregate(manifests: list[Path], out: Path) -> dict:
     for ln in lines:
         if ln["kind"] == "upstream":
             p = Path(ln["gate_out"])
-            ups.append({"case": ln["case"], "status": json.loads(p.read_text())["status"] if p.exists() else "missing"})
+            r = json.loads(p.read_text()) if p.exists() else None
+            ups.append(
+                {"case": ln["case"], "status": "missing" if r is None else "stale" if _stale(r) else r["status"]}
+            )
     dec = decide(rows, timings)
     out.write_text(render(rows, dec, ups, timings))
     return dec

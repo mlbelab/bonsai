@@ -30,10 +30,7 @@ ACCEPT_DLOGL = 1e-6  # merge iff the best normal dLogL > this (TH:2428, A4)
 ADD_AS_CHILD_T = 1e-6  # t_1a < this with child 1 internal: t_1a := 0 (TH:2467-2476, A18)
 REDO_TIME_FRAC, REDO_TIME_MIN = 0.05, 10  # redoTimeAt = max(⌊0.05·C⌋, 10) (TH:1154, 2354)
 REDO_NN_FRAC, REDO_NN_MIN = 0.1, 10  # kNN rebuild schedule (TH:1951, A19); unused here (all pairs)
-NN_MIN_CHILDREN = 50  # kNN only when C > 50 (MA:176, TH:1888); unused here
-LAZY_MIN_CHILDREN = 10  # bounds only when C > 10 (TH:1040); unused here
 STAR_TOL, STAR_MAX_SWEEPS, STAR_T_MAX = 1e-4, 1000, 1e8  # star EM (TH:4992-5004)
-K_NN = 10  # use_knn (config.py:75); unused here
 
 
 class Event(NamedTuple):
