@@ -33,6 +33,10 @@ acceptance does not lose the L-BFGS work. With ``esc_flat``/``esc_floor`` in the
 ``escape_step`` from the given endpoint and writes the escaped endpoint (unprefixed) to OUT.
 """
 
+# mypy: disable-error-code="return-value"
+# File-wide because the only two hits (eigh: numpy's EighResult vs tuple; escape_point: best[1] as object) sit in
+# functions hashed by bench.gate.acceptance_hash/escape_hash, whose source must not change (not even a line ignore).
+
 import os
 import sys
 import time
@@ -566,6 +570,7 @@ def main(argv: list[str]) -> None:
         ep = _fields(z, Endpoint, "ep_") if "ep_s" in z.files else None
         flags = (bool(z["esc_flat"]), bool(z["esc_floor"])) if "esc_flat" in z.files else None
     if flags is not None:  # A16g: one escape step, the escaped endpoint is the output
+        assert ep is not None, "an escape input carries its endpoint (gate.escape_subprocess)"
         np.savez(out, **asdict(escape_step(a[0], a[2], a[3], ep, *flags)))
         return
     if ep is None:

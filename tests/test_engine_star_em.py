@@ -42,14 +42,26 @@ def test_engine_star_em_kkt_x64():
 @pytest.mark.x64
 def test_child_time_clamps_only_on_strictly_negative_derivative():
     """D(0) == 0 exactly with D increasing at 0: the strict clamp (TH:4796) does not fire and both the
-    engine and the reference step move to the positive root (a ``<=`` clamp would return 0)."""
-    v, W = np.array([1.0, 100.0]), np.array([1e6, 1e6])
-    d2 = np.array([0.0, 10099.989999])  # Σ_g w(w d² − 1 + w/W) rounds to exactly 0.0 in fp64 (both formulas)
+    engine and the reference step move to the positive root (a ``<=`` clamp would return 0). D(0) = −2⁻¹⁶
+    (same data, d² lowered by 2⁻¹²) clamps to 0 although D(1e-3) > 0.
+
+    Every value is a dyadic rational, so each per-gene term w(w d² − 1 + 1/(T W)) (and the engine's
+    w(w d² − 1 + w/W)) is computed exactly: −(1 − 2⁻²⁰) and +(1 − 2⁻²⁰), whose sum is exactly 0.0 in
+    any summation order (checked: np.sum, math.fsum, reversed, np.dot, dsum).
+    """
+    v, W = np.array([1.0, 4.0]), np.array([2.0**20, 2.0**20])
+    d2 = np.array([0.0, 20 - 2.0**-16 - 2.0**-20])
     w = 1.0 / v
+    terms = w * (w * d2 - 1.0 + w / W)
+    assert terms.tolist() == [-(1 - 2.0**-20), 1 - 2.0**-20]  # exact, so the sum is order-free
     assert _star_dlogl(0.0, v, d2, W) == 0.0 and _star_dlogl(1e-3, v, d2, W) > 0
-    assert float(dsum(jnp.asarray(w * (w * d2 - 1.0 + w / W)))) == 0.0  # the engine's D(0)
+    assert float(dsum(jnp.asarray(terms))) == 0.0  # the engine's D(0)
     assert ref_child_time(1.0, v, d2, W) > 0
     assert float(_child_time(jnp.asarray(1.0), jnp.asarray(v), jnp.asarray(d2), jnp.asarray(W))) > 0
+    d2_neg = d2 - np.array([0.0, 2.0**-12])  # term 2 drops by exactly 2⁻¹⁶
+    assert _star_dlogl(0.0, v, d2_neg, W) == -(2.0**-16) and _star_dlogl(1e-3, v, d2_neg, W) > 0
+    assert ref_child_time(1.0, v, d2_neg, W) == 0.0
+    assert float(_child_time(jnp.asarray(1.0), jnp.asarray(v), jnp.asarray(d2_neg), jnp.asarray(W))) == 0.0
 
 
 def test_engine_star_em_fp32_value_matches_reference():

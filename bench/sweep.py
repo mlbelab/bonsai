@@ -24,6 +24,7 @@ import glob
 import json
 import statistics
 from pathlib import Path
+from typing import Any
 
 from . import metadata
 
@@ -111,6 +112,7 @@ def build_manifest(
     """Manifest lines of ``wave`` (see the module docstring); ``id`` is the array index within the wave."""
     root = Path(root).resolve()
     ups = {c: resolve_upstream(c, baselines, golden) for c in CASES}
+    lines: list[dict[str, Any]]
     if wave == 1:
         lines = [
             {"kind": "upstream", "case": c, "setting": "upstream", "upstream": str(ups[c]), "gate_out": str(root / "upstream" / f"{c}.json"), "cache": str(root / "retime_cache")}
@@ -162,7 +164,8 @@ def _eligible(rows: dict, cases, key) -> tuple[bool, list[str]]:
 
 def _median_greedy(timings: dict, cases, mode: str, M: int) -> float | None:
     ts = [timings.get((c, mode, M)) for c in cases if c.startswith("sim10k")]
-    return None if not ts or any(t is None for t in ts) else statistics.median(ts)
+    vals = [t for t in ts if t is not None]
+    return statistics.median(vals) if ts and len(vals) == len(ts) else None
 
 
 def decide(table: list[dict], timings: dict | None = None, cases=CASES) -> dict:
@@ -175,7 +178,7 @@ def decide(table: list[dict], timings: dict | None = None, cases=CASES) -> dict:
     smaller M. R3 only reports pass/fail per m (m = 1 stays the default).
     """
     rows = {(r["case"], r["mode"], r["M"], r["m"]): r for r in table}
-    out = {
+    out: dict[str, Any] = {
         "blocked": sorted({r["case"] for r in table if r["status"] == "upstream_invalid"}),
         "R1": None,
         "R2": None,
@@ -212,13 +215,13 @@ def decide(table: list[dict], timings: dict | None = None, cases=CASES) -> dict:
             notes.append(f"R2 M={M} ineligible: {why}")
         elif med[M] is None:
             notes.append(f"R2 M={M} eligible but a 10k warm greedy time is missing")
-    med = {M: t for M, t in med.items() if t is not None}
-    out["R2_medians"] = med
-    if not med:
+    timed = {M: t for M, t in med.items() if t is not None}
+    out["R2_medians"] = timed
+    if not timed:
         notes.append("R2: no eligible M with timings; no default")
         return out
-    best = min(sorted(med), key=lambda M: med[M])
-    out["R2"] = 256 if 256 in med and med[256] <= (1 + R2_TOL) * med[best] else best
+    best = min(sorted(timed), key=lambda M: timed[M])
+    out["R2"] = 256 if 256 in timed and timed[256] <= (1 + R2_TOL) * timed[best] else best
     for m in (4, 16):
         ok, why = _eligible(rows, cases, (mode, out["R2"], m))
         out["R3"][m] = {"pass": ok, "why": why}
@@ -387,7 +390,8 @@ def _timing_expansion(ln: dict) -> tuple[list[dict], dict]:
 def aggregate(manifests: list[Path], out: Path) -> dict:
     """Write the measurements markdown for the wave ``manifests`` to ``out``; return the A17 decisions."""
     lines = [ln for m in manifests for ln in read_manifest(m)]
-    jax, timings = [ln for ln in lines if ln["kind"] == "jax"], {}
+    jax = [ln for ln in lines if ln["kind"] == "jax"]
+    timings: dict[tuple[str, str, int], float] = {}
     for ln in lines:
         if ln["kind"] == "timing":
             pseudo, t = _timing_expansion(ln)

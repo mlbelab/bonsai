@@ -292,6 +292,8 @@ re-optimisation at the root every max(⌊0.05·C⌋, 10) merges (TH:1154, 2354),
   (iii) any global optimality. The M2 verdicts are unaffected: the A1 margins are 1.9e-3 to 1.4e-2 per entry against
   the 1e-6 slack. M3: consider escaping at 0.5·bound, extending the floor term to s < −5, and making asym > 1e-8
   INVALID; deferred because each changes `acceptance_hash` and would invalidate the memoised 10k acceptances.
+  With the same change, drop the file-level `# mypy: disable-error-code="return-value"` in `bench/retime.py` (it
+  exists only because the two errors sit in hashed functions: `eigh`'s return type and `escape_point`'s `best[1]`).
 - A24 false stops (the one-sided guard; `false_stop_check` counts, measurements in `data/m2_gate/measurements.md`):
   sim10k_s0/s1/s2 sequential 1/3/2 stops with a band row whose fp64 d > 1e-6 (band rows 75/113/86); sim10k_s2 joint
   M = 256, m = 16: 1; joint m = 1 at the default setting: 0. Decision: keep the one-sided guard, since the default

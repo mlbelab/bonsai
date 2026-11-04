@@ -44,6 +44,7 @@ import sys
 import tempfile
 from dataclasses import asdict, fields
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -102,11 +103,17 @@ def escape_subprocess(parent, t, x, var, device, ep: Endpoint, flat: bool, floor
         return retime.load_endpoint(out)
 
 
+class RetimeError(subprocess.CalledProcessError):
+    """A failed ``bench.retime`` subprocess; ``endpoint`` is the endpoint it saved before failing, else ``None``."""
+
+    endpoint: Endpoint | None = None
+
+
 def retime_subprocess(parent, t, x, var, device: str | None = None, endpoint: Endpoint | None = None):
     """(RetimeResult, Endpoint) of ``bench.retime`` in a ``JAX_ENABLE_X64=1`` subprocess (on GPU ``device`` if given).
 
     With ``endpoint`` the subprocess skips L-BFGS and only runs the A16f acceptance on it. If the subprocess fails
-    after L-BFGS, the raised ``CalledProcessError`` carries the saved endpoint as ``.endpoint`` (else ``None``).
+    after L-BFGS, the raised ``RetimeError`` (a ``CalledProcessError``) carries the saved endpoint as ``.endpoint`` (else ``None``).
     """
     env = _env(device)
     ep = {} if endpoint is None else {f"ep_{k}": v for k, v in asdict(endpoint).items()}
@@ -119,8 +126,9 @@ def retime_subprocess(parent, t, x, var, device: str | None = None, endpoint: En
             )
         except subprocess.CalledProcessError as err:  # keep a fresh endpoint saved before the acceptance failed
             ep_f = Path(retime.endpoint_path(out))
-            err.endpoint = retime.load_endpoint(ep_f) if ep_f.exists() else None
-            raise
+            exc = RetimeError(err.returncode, err.cmd, err.output, err.stderr)
+            exc.endpoint = retime.load_endpoint(ep_f) if ep_f.exists() else None
+            raise exc from err
         return load(out)
 
 
@@ -144,6 +152,7 @@ def code_hash() -> str:
     for name in _ENDPOINT_CODE:
         h.update(inspect.getsource(getattr(retime, name)).encode())
     for mod in (engine_tree, numerics, array_tree, ref_tree, ref_newick):
+        assert mod.__file__ is not None  # plain source modules (only namespace packages lack __file__)
         h.update(Path(mod.__file__).read_bytes())
     return h.hexdigest()
 
@@ -251,15 +260,16 @@ def retime_cached(
     code = code_hash()
     ep = _load_entry(f, code) if f.exists() else None
     hit = ep is not None
-    if hit and (acc := _acceptance_file(cache_dir, key, ep)).exists():
+    if ep is not None and (acc := _acceptance_file(cache_dir, key, ep)).exists():
         with np.load(acc) as z:
             rt = retime._fields(z, RetimeResult)
         return rt, True, key
     try:
         rt, ep_out = retime_subprocess(parent, t, x, var, device, endpoint=ep)
     except subprocess.CalledProcessError as err:
-        if not hit and getattr(err, "endpoint", None) is not None:
-            _savez_atomic(f, **asdict(err.endpoint), code_hash=code)
+        saved = getattr(err, "endpoint", None)  # set on a RetimeError
+        if not hit and saved is not None:
+            _savez_atomic(f, **asdict(saved), code_hash=code)
         raise
     if not hit:
         _savez_atomic(f, **asdict(ep_out), code_hash=code)
@@ -269,7 +279,7 @@ def retime_cached(
 
 def _too_large(t, n_edges: int) -> RetimeResult:
     """An INVALID result for a tree whose dense acceptance Hessian exceeds ``RETIME_HESS_MAX_BYTES`` (nothing run)."""
-    nan = {f.name: np.nan for f in fields(RetimeResult)}
+    nan: dict[str, Any] = {f.name: np.nan for f in fields(RetimeResult)}
     reason = (
         f"scale guard: dense Hessian of {n_edges} edges needs {8.0 * n_edges**2 / 1e9:.1f} GB"
         f" > RETIME_HESS_MAX_BYTES {RETIME_HESS_MAX_BYTES / 1e9:.0f} GB; not re-timed"
@@ -297,6 +307,7 @@ def retime_escaped(
         hit = key = ef = None
     else:
         rt, hit, key = retime_cached(parent, t, names, leaf_sha, x, var, device, cache_dir)
+        assert key is not None  # retime_cached returns a key whenever cache_dir is given
         ep = retime.load_endpoint(Path(cache_dir) / f"{key}.npz")
         ef = Path(cache_dir) / f"{escape_key(key)}.npz"
 
@@ -315,13 +326,17 @@ def retime_escaped(
     if ef is not None and ef.exists() and retime.needs_escape(rt, bound):  # stale if the original now passes
         with np.load(ef) as z:
             st = retime.read_escape(z)
-    start = (st[0], None, *st[1:]) if st else (ep, rt)
+    # resume a stored escape state (its last acceptance is re-read through acc), else start from the endpoint
+    ep0, r0, n0, rows0, L00 = (st[0], None, *st[1:]) if st else (ep, rt, 0, (), None)
     r, (_, n, rows, L0) = retime.settle(
         acc,
         lambda e, r: escape_subprocess(parent, t, x, var, device, e, *retime.escape_flags(r)),
-        start[0],
+        ep0,
         bound,
-        *start[1:],
+        r=r0,
+        n=n0,
+        rows=rows0,
+        L0=L00,
         save=None if ef is None else lambda state: _savez_atomic(ef, **retime.escape_fields(state)),
     )
     escapes = [dict(zip(retime.ESCAPE_COLS, row, strict=True)) for row in rows.tolist()]
@@ -395,7 +410,7 @@ def _arm_report(arm: dict, cells, x, var, truth, seed: int, device, cache_dir=No
     p, t, nm = stages["redo_starry"]
     X, V = _leaf_arrays(p, nm, cells, x, var)
     rt, hit, key, esc = retime_escaped(p, t, nm, arm["leaf_sha256"], X, V, device, cache_dir)
-    out = {
+    out: dict[str, Any] = {
         "L_raw_stage": L_raw,
         "retime": {k: v for k, v in rt.__dict__.items() if k != "t"} | esc,
         "retime_cache_hit": hit,
@@ -464,7 +479,7 @@ def gate_upstream_only(upstream: Path, device: str | None, cache_dir) -> dict:
 
 def parse_lines(spec: str) -> set[int]:
     """Manifest ids from "0,3-5,9" (ranges inclusive)."""
-    out = set()
+    out: set[int] = set()
     for part in spec.split(","):
         lo, _, hi = part.strip().partition("-")
         out.update(range(int(lo), int(hi or lo) + 1))

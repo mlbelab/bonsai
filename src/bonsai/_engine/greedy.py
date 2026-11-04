@@ -16,7 +16,7 @@ rounding resolution of the 1e-6 threshold is decided on the fp64 host re-score (
 import dataclasses
 import time
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -326,7 +326,7 @@ def greedy_star(
     kids = table.children(p)
     stop = (3 if is_root else 2) if special is None else max(len(kids) - 1, 2)  # expNChild (TH:2301)
     events: list[Event] = []
-    n = {
+    n: dict[str, Any] = {  # int counters, plus "stop_s" (float seconds)
         "scores": 0,
         "host": 0,
         "batches": 0,
@@ -345,6 +345,7 @@ def greedy_star(
     mv = {"Dx": 0.0, "DW": 0.0, "epoch": 0}
     sent: dict = {}  # trace only: (x_R, v_R) per pair as last sent to the device
     nn: dict | None = None  # kNN state: device buffer, host validity mask, child -> row; None: all pairs
+    acc: ParentAcc  # bound below (build_acc), after the closures that read it or rebind it (reopt)
     since, redo_nn_at = 0, 0  # merges since the last kNN build, and its threshold
 
     def build_acc() -> ParentAcc:
@@ -440,7 +441,7 @@ def greedy_star(
         val = np.where(fresh, store.d, store.ub(mv["Dx"], mv["DW"]))  # device score, or the bound of a stale row
         ok = (fresh & ~store.host) | (~fresh & (store.epoch >= 0))
         cand = np.flatnonzero(ok & np.isfinite(val) & (val <= ACCEPT_DLOGL))
-        rows = [r for r in cand if ACCEPT_DLOGL - val[r] <= resolution(r)]
+        rows = [r for r in cand.tolist() if ACCEPT_DLOGL - val[r] <= resolution(r)]
         hits = [host_score(*(int(c) for c in store.ij[r]))[0] > ACCEPT_DLOGL for r in rows]
         n["stop"] += 1
         n["band"] += len(rows)
