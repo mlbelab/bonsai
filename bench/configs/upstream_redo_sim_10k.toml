@@ -1,0 +1,14 @@
+# M2 stage-limited baseline (A22): upstream backend stopped after redo starry, simulated 10k x 3.2k.
+[run]
+name = "upstream_redo_sim_10k"
+seed = 0
+backend = "upstream"
+n_warm = 0
+stop_after = "redo_starry"
+
+[data]
+kind = "simulate"
+n_cells = 10000
+n_genes = 3200  # A-3: the simulator keeps ~1.24k-1.28k genes after Bonsai's filter; 3200 raw genes targets ~2k used
+
+[upstream]

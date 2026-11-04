@@ -173,3 +173,6 @@ AGENTS.md
 .omc/
 .sdd/
 ._*
+
+# benchmark leaf arrays (A23)
+*.npz
