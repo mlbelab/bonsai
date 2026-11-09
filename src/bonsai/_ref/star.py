@@ -1,9 +1,10 @@
-"""fp64 NumPy reference: node messages and star (one parent, C children) log-likelihood terms.
+"""fp64 NumPy reference: node messages, star (one parent, C children) log-likelihood terms, star EM.
 
-Maths ref §2-§3. Children arrays have shape (C, G); ``t`` has shape (C,). Units: 2x (A1).
+Maths ref §2-§3, §9. Children arrays have shape (C, G); ``t`` has shape (C,). Units: 2x (A1).
 """
 
 import numpy as np
+from scipy.optimize import brentq, minimize
 
 
 def node_message(x: np.ndarray, var: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -60,3 +61,61 @@ def two_leaf_dlogl(t: float, S: np.ndarray, d2: np.ndarray) -> float:
     """f(t) = Σ_g (d² − T)/T², T = t + S (der2LeafTree, TH:4927-4930)."""
     T = t + S
     return float(np.sum((-1.0 + d2 / T) / T))
+
+
+def _star_dlogl(t: float, var_c: np.ndarray, d2: np.ndarray, W: np.ndarray) -> float:
+    """Upstream's derLogLikStar (TH:4815-4818): Σ_g w(w d² − 1 + 1/(T W)), T = var_c + t, w = 1/T, x̄ and W frozen."""
+    T = var_c + t
+    w = 1.0 / T
+    return float(np.dot(w, w * d2 - 1.0 + 1.0 / (T * W)))
+
+
+def _child_time(t0: float, var_c: np.ndarray, d2: np.ndarray, W: np.ndarray) -> float:
+    """One child's sweep step (findOptimalTSingleCell, TH:4790-4811).
+
+    0 if D(0) < 0 (strict, TH:4796), else upstream's ×10 bracket from max(t0, 0.01) and a tight brentq
+    (upstream: xtol = rtol = 1e-4).
+    """
+    if _star_dlogl(0.0, var_c, d2, W) < 0:
+        return 0.0
+    lb, ub = 0.0, max(t0, 0.01)
+    while _star_dlogl(ub, var_c, d2, W) >= 0:
+        lb, ub = ub, 10.0 * ub
+    return brentq(_star_dlogl, lb, ub, args=(var_c, d2, W), xtol=1e-14, rtol=4 * np.finfo(float).eps)
+
+
+def star_em(
+    x: np.ndarray, var: np.ndarray, tol: float = 1e-4, max_sweeps: int = 1000
+) -> tuple[np.ndarray, float, bool]:
+    """Star times by upstream's Jacobi fixed point (optimiseTStar, TH:4983-5027; maths ref §9).
+
+    ``x``, ``var``: (C, G) children. Start t = 1; per sweep every child solves dell/dt_c = 0 with the
+    parent message (x̄, W) frozen at the current t (findOptimalTSingleCell, TH:4790-4811): t_c = 0 if
+    the derivative at 0 is < 0 (strict), else upstream's ×10 bracket from max(t_c, 0.01) and a tight
+    brentq (upstream: xtol = rtol = 1e-4). Stops when max_c |Δt_c| < ``tol`` (absolute), max t ≥ 1e8,
+    or after ``max_sweeps``. Returns (t (C,), ell, converged), converged iff the sweeps met ``tol``.
+    Otherwise upstream's fallback: BFGS on log t from the last iterate (TH:5009; clamped children
+    start at log 1e-4, upstream's own floor at TH:4823, not at log 0 = −inf), its t and ell returned
+    with converged False; if BFGS fails, (ones, −1e9, False) (TH:5011-5016).
+    """
+    C = x.shape[0]
+    t = np.ones(C)
+    converged = False
+    sweeps = 0
+    while not converged and t.max() < 1e8 and sweeps < max_sweeps:
+        sweeps += 1
+        xn, W = node_message(x, var, t)
+        t_new = np.array([_child_time(t[c], var[c], (xn - x[c]) ** 2, W) for c in range(C)])
+        converged = bool(np.max(np.abs(t_new - t)) < tol)
+        t = t_new
+    if not converged:
+
+        def neg(s):
+            ell, g = star_loglik_grad(x, var, np.exp(s))
+            return -ell, -np.exp(s) * g
+
+        res = minimize(neg, np.log(np.maximum(t, 1e-4)), jac=True)
+        if not res.success:
+            return np.ones(C), -1e9, False
+        t = np.exp(res.x)
+    return t, star_loglik_grad(x, var, t)[0], converged

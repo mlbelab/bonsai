@@ -1,0 +1,18 @@
+# M2 gate arm (jax backend) on a real dataset; A1 only (no ground truth).
+# Run: --data-path data/<set> --set run.name=jax_real_<set>
+#      --set run.upstream_dir=data/<set>/bonsai_workdir/results   (the full upstream run's results folder:
+# its processed arrays and stage trees are read directly, A23)
+[run]
+name = "jax_real"
+seed = 0
+backend = "jax"
+n_warm = 1
+
+[data]
+kind = "real"
+
+[jax]
+mode = "sequential"
+rescore_top = 256
+merges_per_round = 1
+false_stop_check = true  # diagnostic; R2 timing arms: --set jax.false_stop_check=false
